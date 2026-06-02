@@ -1,0 +1,41 @@
+════════════════════════════════════════════════════════════════════════════
+  BUY VS INVEST — Quick Start (Conda)
+════════════════════════════════════════════════════════════════════════════
+
+You are in: ~/buy-vs-invest
+
+STEP 1: Create the conda environment (one time)
+─────────────────────────────────────────────────
+  conda env create -f environment.yml
+
+STEP 2: Activate it
+────────────────────
+  conda activate buy-vs-invest
+
+STEP 3: Run the app
+────────────────────
+  streamlit run app.py
+
+  → Opens at http://localhost:8501
+
+════════════════════════════════════════════════════════════════════════════
+
+WHAT YOU GET:
+  • Deterministic mode: single fixed-path scenario
+  • Monte Carlo mode: up to 1,000 stochastic simulations
+  • Interactive sliders for all major assumptions
+  • Graphical outputs (Plotly charts)
+  • Export to CSV
+
+TOGGLE MODES:
+  Sidebar → "Analysis mode" → pick "Deterministic" or "Monte Carlo"
+
+RUN TESTS (optional):
+  python test_model.py
+
+TROUBLESHOOTING:
+  • Forgot to activate? → conda activate buy-vs-invest
+  • See environment list → conda env list
+  • Full setup details → see SETUP_CONDA.md
+
+════════════════════════════════════════════════════════════════════════════

@@ -1,32 +1,45 @@
 """
-Streamlit interface for the Buy vs. Invest model.
+Streamlit interface for the Buy vs. Invest model, with deterministic + MC modes.
 
 Run with:  streamlit run app.py
 """
+
+import time
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from model import Assumptions, run_model, stamp_duty, summarise
+from model import (Assumptions, StochasticAssumptions, run_model,
+                   run_monte_carlo, stamp_duty, summarise)
 
 st.set_page_config(page_title="Buy vs Invest", page_icon="🏠", layout="wide")
 
-# ----- light theming -----
+# Light theme - configured via .streamlit/config.toml
 st.markdown(
     """
     <style>
-      .stApp { background: #0e1117; }
-      .metric-good { color: #2dd4bf; }
-      h1, h2, h3 { letter-spacing: -0.02em; }
-      div[data-testid="stMetricValue"] { font-size: 1.4rem; }
+      /* Minimal CSS - most theming done via config.toml */
+      h1, h2, h3, h4, h5, h6 {
+        letter-spacing: -0.02em;
+      }
+      
+      /* Sidebar */
+      [data-testid="stSidebar"] {
+        background-color: #f5f5f5;
+      }
+      
+      /* Plotly charts background */
+      .plotly-graph-div {
+        background-color: white !important;
+      }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.title("🏠  Buy a home vs. keep investing")
+st.title("🏠 Buy a home vs. keep investing")
 st.caption(
     "Compares terminal net worth of buying with a mortgage against renting and "
     "investing the deposit plus any monthly cash-flow difference. All figures GBP."
@@ -36,7 +49,10 @@ st.caption(
 sb = st.sidebar
 sb.header("Assumptions")
 
-with sb.expander("🏡  Property", expanded=True):
+# Toggle between deterministic and Monte Carlo
+mode = sb.radio("📊 Analysis mode", ("Deterministic", "Monte Carlo"), horizontal=False)
+
+with sb.expander("🏡 Property", expanded=True):
     house_price = st.slider("House price (£)", 150_000, 2_500_000, 600_000, 10_000)
     deposit_pct = st.slider("Deposit (%)", 5, 60, 20, 1) / 100
     mortgage_rate = st.slider("Mortgage rate (%)", 0.5, 9.0, 4.5, 0.1) / 100
@@ -45,7 +61,7 @@ with sb.expander("🏡  Property", expanded=True):
     ftb = st.checkbox("First-time buyer (SDLT relief)", value=False)
     addl = st.checkbox("Additional property (+5% SDLT)", value=False)
 
-with sb.expander("🔧  Running & transaction costs"):
+with sb.expander("🔧 Running & transaction costs"):
     maintenance = st.slider("Maintenance (%/yr of value)", 0.0, 3.0, 1.0, 0.1) / 100
     insurance = st.slider("Insurance (%/yr of value)", 0.0, 1.0, 0.15, 0.05) / 100
     service_charge = st.number_input("Service charge / ground rent (£/yr)", 0, 20_000, 0, 250)
@@ -53,156 +69,356 @@ with sb.expander("🔧  Running & transaction costs"):
     legal = st.number_input("Legal + survey (£, one-off)", 0, 15_000, 2_500, 250)
     selling_cost = st.slider("Selling costs (% of value)", 0.0, 4.0, 1.75, 0.25) / 100
 
-with sb.expander("🏘️  Rent (the alternative)"):
+with sb.expander("🏘️ Rent (the alternative)"):
     rent = st.slider("Monthly rent (£)", 500, 8_000, 2_200, 50)
     rent_growth = st.slider("Rent growth (%/yr)", 0.0, 8.0, 3.0, 0.25) / 100
 
-with sb.expander("📈  Investment", expanded=True):
+with sb.expander("📈 Investment", expanded=True):
     inv_return = st.slider("Investment return (%/yr)", 0.0, 12.0, 7.0, 0.25) / 100
     inv_fee = st.slider("Fund fees / OCF (%/yr)", 0.0, 1.5, 0.16, 0.01) / 100
     cgt = st.slider("Capital gains tax on exit (%)", 0, 40, 20, 1) / 100
 
-with sb.expander("🌍  Economy"):
+with sb.expander("🌍 Economy"):
     inflation = st.slider("Inflation (%/yr)", 0.0, 8.0, 2.5, 0.25) / 100
 
-real_terms = sb.toggle("Show in real (today's £) terms", value=False)
+real_terms = sb.toggle("📌 Show in real (today's £) terms", value=False)
+
+# Monte Carlo options
+if mode == "Monte Carlo":
+    sb.divider()
+    sb.subheader("🎲 Monte Carlo options")
+    n_sims = sb.slider("Number of simulations", 10, 1_000, 100, 10,
+                       help="More sims = more accurate but slower")
+    sb.write(f"⏱️ ~{n_sims * 0.025:.1f}s estimated runtime")
+    
+    with sb.expander("📊 Volatility assumptions", expanded=False):
+        inv_vol = st.slider("Investment volatility (%/yr)", 1.0, 30.0, 12.0, 0.5) / 100
+        house_vol = st.slider("House price volatility (%/yr)", 1.0, 20.0, 8.0, 0.5) / 100
+        rent_vol = st.slider("Rent growth volatility (%/yr)", 0.0, 5.0, 2.0, 0.1) / 100
 
 # ------------------------------------------------------------------ run
-a = Assumptions(
-    house_price=house_price, deposit_pct=deposit_pct, mortgage_rate=mortgage_rate,
-    mortgage_term_years=term, house_appreciation=appreciation,
-    first_time_buyer=ftb, additional_property=addl,
-    maintenance_pct=maintenance, insurance_pct=insurance,
-    service_charge=service_charge, council_tax=council_tax,
-    legal_survey_fixed=legal, selling_cost_pct=selling_cost,
-    monthly_rent=rent, rent_growth=rent_growth,
-    investment_return=inv_return, investment_fee=inv_fee, capital_gains_tax=cgt,
-    inflation=inflation,
-)
-
-df = run_model(a)
-summary = summarise(df, a)
-
-buy_col = "buy_net_worth_real" if real_terms else "buy_net_worth"
-inv_col = "invest_net_worth_real" if real_terms else "invest_net_worth"
-suffix = " (real)" if real_terms else ""
-
-
-def gbp(x: float) -> str:
-    return f"£{x:,.0f}"
-
-
-# ------------------------------------------------------------------ top cards
-deposit = df.attrs["deposit"]
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Deposit", gbp(deposit))
-c2.metric("Stamp duty (SDLT)", gbp(df.attrs["sdlt"]))
-c3.metric("Loan", gbp(df.attrs["loan"]))
-c4.metric("Cash needed upfront", gbp(df.attrs["upfront_purchase_costs"]))
-
-st.divider()
-
-# ------------------------------------------------------------------ horizon cards
-st.subheader("Verdict by horizon")
-cols = st.columns(len(a.horizons))
-for col, (_, r) in zip(cols, summary.iterrows()):
-    buy = r["Buy (real)" if real_terms else "Buy net worth"]
-    inv = r["Invest (real)" if real_terms else "Invest net worth"]
-    winner = "Buy" if buy >= inv else "Invest"
-    gap = abs(buy - inv)
-    col.markdown(f"**{int(r['Horizon (yrs)'])} years**")
-    col.metric(
-        f"🏆 {winner}",
-        gbp(max(buy, inv)),
-        delta=f"+{gbp(gap)} vs other",
+if mode == "Deterministic":
+    a = Assumptions(
+        house_price=house_price, deposit_pct=deposit_pct, mortgage_rate=mortgage_rate,
+        mortgage_term_years=term, house_appreciation=appreciation,
+        first_time_buyer=ftb, additional_property=addl,
+        maintenance_pct=maintenance, insurance_pct=insurance,
+        service_charge=service_charge, council_tax=council_tax,
+        legal_survey_fixed=legal, selling_cost_pct=selling_cost,
+        monthly_rent=rent, rent_growth=rent_growth,
+        investment_return=inv_return, investment_fee=inv_fee, capital_gains_tax=cgt,
+        inflation=inflation,
     )
-    col.caption(f"Buy {gbp(buy)} · Invest {gbp(inv)}")
+    
+    df = run_model(a)
+    summary = summarise(df, a)
+    
+    buy_col = "buy_net_worth_real" if real_terms else "buy_net_worth"
+    inv_col = "invest_net_worth_real" if real_terms else "invest_net_worth"
+    suffix = " (real)" if real_terms else ""
+    
+    def gbp(x: float) -> str:
+        return f"£{x:,.0f}"
+    
+    # ---- top cards
+    deposit = df.attrs["deposit"]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Deposit", gbp(deposit))
+    c2.metric("Stamp duty (SDLT)", gbp(df.attrs["sdlt"]))
+    c3.metric("Loan", gbp(df.attrs["loan"]))
+    c4.metric("Cash needed upfront", gbp(df.attrs["upfront_purchase_costs"]))
+    
+    st.divider()
+    
+    # ---- horizon cards
+    st.subheader("Verdict by horizon")
+    cols = st.columns(len(a.horizons))
+    for col, (_, r) in zip(cols, summary.iterrows()):
+        buy = r["Buy (real)" if real_terms else "Buy net worth"]
+        inv = r["Invest (real)" if real_terms else "Invest net worth"]
+        winner = "🏠 Buy" if buy >= inv else "📈 Invest"
+        gap = abs(buy - inv)
+        col.markdown(f"**{int(r['Horizon (yrs)'])} years**")
+        col.metric(
+            f"🏆 {winner}",
+            gbp(max(buy, inv)),
+            delta=f"+{gbp(gap)} vs other",
+        )
+        col.caption(f"Buy {gbp(buy)} · Invest {gbp(inv)}")
+    
+    st.divider()
+    
+    # ---- main chart
+    st.subheader(f"Net worth over time{suffix}")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["year"], y=df[buy_col], name="Buy", mode="lines",
+        line=dict(color="#1e88e5", width=3),
+        hovertemplate="Yr %{x:.1f}<br>Buy £%{y:,.0f}<extra></extra>"))
+    fig.add_trace(go.Scatter(
+        x=df["year"], y=df[inv_col], name="Invest", mode="lines",
+        line=dict(color="#f57c00", width=3),
+        hovertemplate="Yr %{x:.1f}<br>Invest £%{y:,.0f}<extra></extra>"))
+    for h in a.horizons:
+        fig.add_vline(x=h, line_dash="dot", line_color="#999999", opacity=0.5)
+    fig.update_layout(
+        template="plotly_white", height=460, hovermode="x unified",
+        margin=dict(l=10, r=10, t=10, b=10),
+        legend=dict(orientation="h", y=1.05),
+        yaxis_title="Net worth (£)", xaxis_title="Years",
+        font=dict(size=12, color="#333333"),
+        paper_bgcolor="white", plot_bgcolor="#fafafa")
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # ---- components
+    left, right = st.columns(2)
+    
+    with left:
+        st.subheader("Buy: equity vs debt")
+        f2 = go.Figure()
+        f2.add_trace(go.Scatter(x=df["year"], y=df["house_value"], name="House value",
+                                line=dict(color="#4caf50")))
+        f2.add_trace(go.Scatter(x=df["year"], y=df["home_equity"], name="Your equity",
+                                fill="tozeroy", line=dict(color="#1e88e5")))
+        f2.add_trace(go.Scatter(x=df["year"], y=df["loan_balance"], name="Mortgage left",
+                                line=dict(color="#d32f2f", dash="dot")))
+        f2.update_layout(template="plotly_white", height=320,
+                         margin=dict(l=10, r=10, t=10, b=10),
+                         legend=dict(orientation="h", y=1.1),
+                         font=dict(size=11, color="#333333"),
+                         paper_bgcolor="white", plot_bgcolor="#fafafa")
+        st.plotly_chart(f2, use_container_width=True)
+    
+    with right:
+        st.subheader("Monthly outgoings: buy vs rent")
+        f3 = go.Figure()
+        f3.add_trace(go.Scatter(x=df["year"], y=df["buy_outgoing"], name="Buy /mo",
+                                line=dict(color="#1e88e5")))
+        f3.add_trace(go.Scatter(x=df["year"], y=df["rent_outgoing"], name="Rent /mo",
+                                line=dict(color="#f57c00")))
+        f3.update_layout(template="plotly_white", height=320,
+                         margin=dict(l=10, r=10, t=10, b=10),
+                         legend=dict(orientation="h", y=1.1),
+                         font=dict(size=11, color="#333333"),
+                         paper_bgcolor="white", plot_bgcolor="#fafafa")
+        st.plotly_chart(f3, use_container_width=True)
+    
+    # ---- table
+    st.subheader("Summary table")
+    show = summary.copy()
+    money_cols = ["Buy net worth", "Invest net worth", "Difference (Buy − Invest)",
+                  "Buy (real)", "Invest (real)"]
+    for c in money_cols:
+        show[c] = show[c].map(gbp)
+    st.dataframe(show, use_container_width=True, hide_index=True)
+    
+    st.download_button(
+        "⬇️ Download full monthly projection (CSV)",
+        df.to_csv(index=False).encode(),
+        file_name="buy_vs_invest_deterministic.csv", mime="text/csv")
 
+
+else:  # Monte Carlo mode
+    a = StochasticAssumptions(
+        house_price=house_price, deposit_pct=deposit_pct, mortgage_rate=mortgage_rate,
+        mortgage_term_years=term, house_appreciation=appreciation,
+        house_appreciation_std=house_vol,
+        first_time_buyer=ftb, additional_property=addl,
+        maintenance_pct=maintenance, insurance_pct=insurance,
+        service_charge=service_charge, council_tax=council_tax,
+        legal_survey_fixed=legal, selling_cost_pct=selling_cost,
+        monthly_rent=rent, rent_growth=rent_growth, rent_growth_std=rent_vol,
+        investment_return=inv_return, investment_fee=inv_fee,
+        investment_return_std=inv_vol,
+        capital_gains_tax=cgt,
+        inflation=inflation,
+    )
+    
+    # Run MC with progress indicator
+    with st.spinner(f"Running {n_sims} Monte Carlo simulations..."):
+        t0 = time.time()
+        pct_df, win_df, buy_out, inv_out = run_monte_carlo(a, n_sims=n_sims)
+        t1 = time.time()
+    
+    st.success(f"✓ Completed in {t1-t0:.2f}s")
+    
+    def gbp(x: float) -> str:
+        return f"£{x:,.0f}"
+    
+    deposit = a.house_price * a.deposit_pct
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Deposit", gbp(deposit))
+    c2.metric("Stamp duty (SDLT)", gbp(stamp_duty(a.house_price, a.first_time_buyer, a.additional_property)))
+    c3.metric("Loan", gbp(a.house_price - deposit))
+    c4.metric("Sims run", f"{n_sims}")
+    
+    st.divider()
+    
+    # Win rates
+    st.subheader("Win probability by horizon")
+    cols = st.columns(len(a.horizons))
+    for col, (_, r) in zip(cols, win_df.iterrows()):
+        h = int(r["Horizon (yrs)"])
+        buy_pct = r["Buy wins (%)"]
+        inv_pct = r["Invest wins (%)"]
+        winner = "🏠 Buy" if buy_pct >= 50 else "📈 Invest"
+        col.markdown(f"**{h} years**")
+        col.metric(f"{winner}", f"{max(buy_pct, inv_pct):.0f}%")
+        col.caption(f"Buy {buy_pct:.0f}% · Invest {inv_pct:.0f}%")
+    
+    st.divider()
+    
+    # Percentile distribution with filled uncertainty ranges
+    st.subheader("Net worth distribution with uncertainty ranges")
+    
+    fig_pct = go.Figure()
+    
+    # Buy outcomes with filled uncertainty range (10th-90th percentile)
+    buy_90 = pct_df["Buy 90th %ile"].values
+    buy_10 = pct_df["Buy 10th %ile"].values
+    buy_med = pct_df["Buy median"].values
+    horizons = pct_df["Horizon (yrs)"].values
+    
+    # Add filled area between 10th and 90th percentile for Buy
+    fig_pct.add_trace(go.Scatter(
+        x=horizons, y=buy_90, 
+        name="Buy (90th %ile)",
+        line=dict(color="rgba(30, 136, 229, 0)", width=0),
+        hovertemplate="Yr %{x}<br>Buy 90th: £%{y:,.0f}<extra></extra>"
+    ))
+    fig_pct.add_trace(go.Scatter(
+        x=horizons, y=buy_10,
+        name="Buy (10th %ile)",
+        line=dict(color="rgba(30, 136, 229, 0)", width=0),
+        fillcolor="rgba(30, 136, 229, 0.2)",
+        fill="tonexty",
+        hovertemplate="Yr %{x}<br>Buy 10th: £%{y:,.0f}<extra></extra>"
+    ))
+    
+    # Buy median line
+    fig_pct.add_trace(go.Scatter(
+        x=horizons, y=buy_med,
+        name="Buy (median)",
+        line=dict(color="#1e88e5", width=3),
+        hovertemplate="Yr %{x}<br>Buy median: £%{y:,.0f}<extra></extra>"
+    ))
+    
+    # Invest outcomes with filled uncertainty range
+    inv_90 = pct_df["Invest 90th %ile"].values
+    inv_10 = pct_df["Invest 10th %ile"].values
+    inv_med = pct_df["Invest median"].values
+    
+    # Add filled area between 10th and 90th percentile for Invest
+    fig_pct.add_trace(go.Scatter(
+        x=horizons, y=inv_90,
+        name="Invest (90th %ile)",
+        line=dict(color="rgba(245, 124, 0, 0)", width=0),
+        hovertemplate="Yr %{x}<br>Invest 90th: £%{y:,.0f}<extra></extra>"
+    ))
+    fig_pct.add_trace(go.Scatter(
+        x=horizons, y=inv_10,
+        name="Invest (10th %ile)",
+        line=dict(color="rgba(245, 124, 0, 0)", width=0),
+        fillcolor="rgba(245, 124, 0, 0.2)",
+        fill="tonexty",
+        hovertemplate="Yr %{x}<br>Invest 10th: £%{y:,.0f}<extra></extra>"
+    ))
+    
+    # Invest median line
+    fig_pct.add_trace(go.Scatter(
+        x=horizons, y=inv_med,
+        name="Invest (median)",
+        line=dict(color="#f57c00", width=3),
+        hovertemplate="Yr %{x}<br>Invest median: £%{y:,.0f}<extra></extra>"
+    ))
+    
+    fig_pct.update_layout(
+        template="plotly_white", height=480, hovermode="x unified",
+        margin=dict(l=10, r=10, t=10, b=10),
+        legend=dict(orientation="v", x=1.02, y=1, bgcolor="rgba(255,255,255,0.8)"),
+        xaxis_title="Years", yaxis_title="Net worth (£)",
+        font=dict(size=12, color="#333333"),
+        paper_bgcolor="white", plot_bgcolor="#fafafa")
+    st.plotly_chart(fig_pct, use_container_width=True)
+    
+    st.caption("💡 Blue shaded area = range of Buy outcomes (10th–90th percentile). Orange shaded area = range of Invest outcomes. Bold lines = median (50th percentile).")
+    
+    st.divider()
+    
+    # Box and whisker plot
+    st.subheader("Distribution comparison at each horizon")
+    fig_fan = go.Figure()
+    
+    for h in a.horizons:
+        buy_vals = np.array(buy_out[h]) / 1e6  # convert to millions for readability
+        inv_vals = np.array(inv_out[h]) / 1e6
+        
+        fig_fan.add_trace(go.Box(
+            y=buy_vals, name=f"Buy {h}y", marker=dict(color="#1e88e5"),
+            boxmean='sd'))
+        fig_fan.add_trace(go.Box(
+            y=inv_vals, name=f"Invest {h}y", marker=dict(color="#f57c00"),
+            boxmean='sd'))
+    
+    fig_fan.update_layout(
+        template="plotly_white", height=420,
+        margin=dict(l=10, r=10, t=10, b=10),
+        yaxis_title="Net worth (£ millions)", boxmode="group",
+        font=dict(size=12, color="#333333"),
+        paper_bgcolor="white", plot_bgcolor="#fafafa")
+    st.plotly_chart(fig_fan, use_container_width=True)
+    
+    st.caption("📊 Box = 25th to 75th percentile (interquartile range). Whisker = full range. Line inside box = median. Cross = mean.")
+    
+    # Percentile table
+    st.divider()
+    st.subheader("Percentile summary table")
+    show_pct = pct_df.copy()
+    for col in show_pct.columns:
+        if col != "Horizon (yrs)":
+            show_pct[col] = show_pct[col].map(gbp)
+    st.dataframe(show_pct, use_container_width=True, hide_index=True)
+    
+    st.subheader("Win rates summary")
+    show_win = win_df.copy()
+    for col in show_win.columns:
+        if col != "Horizon (yrs)":
+            show_win[col] = show_win[col].apply(lambda x: f"{x:.1f}%")
+    st.dataframe(show_win, use_container_width=True, hide_index=True)
+    
+    # Export options
+    csv_pct = pct_df.to_csv(index=False)
+    csv_win = win_df.to_csv(index=False)
+    combined = f"# Percentiles\n{csv_pct}\n\n# Win rates\n{csv_win}"
+    st.download_button(
+        "⬇️ Download MC summary (CSV)",
+        combined.encode(),
+        file_name="buy_vs_invest_monte_carlo.csv", mime="text/csv")
+
+# ---- footer / caveats
 st.divider()
-
-# ------------------------------------------------------------------ main chart
-st.subheader(f"Net worth over time{suffix}")
-fig = go.Figure()
-fig.add_trace(go.Scatter(
-    x=df["year"], y=df[buy_col], name="Buy", mode="lines",
-    line=dict(color="#2dd4bf", width=3),
-    hovertemplate="Yr %{x:.1f}<br>Buy £%{y:,.0f}<extra></extra>"))
-fig.add_trace(go.Scatter(
-    x=df["year"], y=df[inv_col], name="Invest", mode="lines",
-    line=dict(color="#f59e0b", width=3),
-    hovertemplate="Yr %{x:.1f}<br>Invest £%{y:,.0f}<extra></extra>"))
-# shade who's ahead
-fig.add_trace(go.Scatter(
-    x=df["year"], y=np.where(df[buy_col] >= df[inv_col], df[buy_col], df[inv_col]),
-    fill=None, mode="lines", line=dict(width=0), showlegend=False,
-    hoverinfo="skip"))
-for h in a.horizons:
-    fig.add_vline(x=h, line_dash="dot", line_color="#475569", opacity=0.5)
-fig.update_layout(
-    template="plotly_dark", height=460, hovermode="x unified",
-    margin=dict(l=10, r=10, t=10, b=10),
-    legend=dict(orientation="h", y=1.05),
-    yaxis_title="Net worth (£)", xaxis_title="Years",
-    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-st.plotly_chart(fig, use_container_width=True)
-
-# ------------------------------------------------------------------ components
-left, right = st.columns(2)
-
-with left:
-    st.subheader("Buy: equity vs debt")
-    f2 = go.Figure()
-    f2.add_trace(go.Scatter(x=df["year"], y=df["house_value"], name="House value",
-                            line=dict(color="#60a5fa")))
-    f2.add_trace(go.Scatter(x=df["year"], y=df["home_equity"], name="Your equity",
-                            fill="tozeroy", line=dict(color="#2dd4bf")))
-    f2.add_trace(go.Scatter(x=df["year"], y=df["loan_balance"], name="Mortgage left",
-                            line=dict(color="#ef4444", dash="dot")))
-    f2.update_layout(template="plotly_dark", height=320,
-                     margin=dict(l=10, r=10, t=10, b=10),
-                     legend=dict(orientation="h", y=1.1),
-                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-    st.plotly_chart(f2, use_container_width=True)
-
-with right:
-    st.subheader("Monthly outgoings: buy vs rent")
-    f3 = go.Figure()
-    f3.add_trace(go.Scatter(x=df["year"], y=df["buy_outgoing"], name="Buy /mo",
-                            line=dict(color="#2dd4bf")))
-    f3.add_trace(go.Scatter(x=df["year"], y=df["rent_outgoing"], name="Rent /mo",
-                            line=dict(color="#f59e0b")))
-    f3.update_layout(template="plotly_dark", height=320,
-                     margin=dict(l=10, r=10, t=10, b=10),
-                     legend=dict(orientation="h", y=1.1),
-                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-    st.plotly_chart(f3, use_container_width=True)
-
-# ------------------------------------------------------------------ table + export
-st.subheader("Summary table")
-show = summary.copy()
-money_cols = ["Buy net worth", "Invest net worth", "Difference (Buy − Invest)",
-              "Buy (real)", "Invest (real)"]
-for c in money_cols:
-    show[c] = show[c].map(gbp)
-st.dataframe(show, use_container_width=True, hide_index=True)
-
-st.download_button(
-    "⬇️  Download full monthly projection (CSV)",
-    df.to_csv(index=False).encode(),
-    file_name="buy_vs_invest_projection.csv", mime="text/csv")
-
-with st.expander("ℹ️  How this works & caveats"):
+with st.expander("ℹ️ How this works & caveats"):
     st.markdown(
         """
-- **Buy net worth** = home value − remaining mortgage − selling costs, net of CGT
-  on any buyer-side invested surplus.
-- **Invest net worth** = the renter invests the buyer's full upfront cash (deposit
-  + SDLT + legal) and every month invests the difference when buying costs more
-  than renting; shown net of CGT on gains at exit.
-- Both renter and owner pay council tax. Rent and house prices grow at their own
-  rates; investment return is net of fund fees.
-- **Not advice.** A single deterministic path hides sequence-of-returns risk —
-  try low/median/high return scenarios. SDLT bands are England & N. Ireland
-  (Apr 2025); Scotland (LBTT) and Wales (LTT) differ.
+**Deterministic mode:**
+- Single fixed path: house grows at 3%/yr, returns at 7%/yr, etc.
+- Buy net worth = home equity − selling costs, net of CGT.
+- Invest net worth = portfolio minus CGT on gains at exit.
+
+**Monte Carlo mode:**
+- Runs N independent paths with returns sampled from normal distributions.
+- House price, investment returns, and rent growth each vary year-to-year.
+- **Uncertainty ranges** (filled area) show 10th to 90th percentile outcomes (80% of paths).
+- **Median** (bold line) shows the middle outcome.
+- **Box plots** show the full distribution at 5-year intervals.
+- **Win probability** shows % of simulations where each strategy wins.
+- Useful for stress-testing and understanding range of outcomes.
+
+**Both modes:**
+- Both renter and owner pay council tax. Rent and house prices grow at their own rates.
+- Investment return is net of fund fees (~0.16% OCF).
+- SDLT bands are England & N. Ireland (Apr 2025); Scotland (LBTT) and Wales (LTT) differ.
+- Tax treatment is simplified; seek professional advice before major decisions.
+- **Not financial advice.** This is an educational tool for scenario planning.
         """
     )

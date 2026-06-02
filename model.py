@@ -104,7 +104,7 @@ class Assumptions:
     inflation: float = 0.025             # annual CPI, for "real" conversions
 
     # Horizons to report
-    horizons: List[int] = field(default_factory=lambda: [5, 10, 20, 30])
+    horizons: List[int] = field(default_factory=lambda: [5, 10, 15, 20, 25, 30])
 
 
 def _amortisation_schedule(principal: float, annual_rate: float,

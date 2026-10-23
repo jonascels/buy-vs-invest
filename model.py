@@ -294,7 +294,8 @@ def run_model_stochastic(a: StochasticAssumptions, seed: int | None = None
     months = max_years * 12
     
     # Draw annual shocks for each path
-    inv_shocks = np.random.normal(a.investment_return, a.investment_return_std, max_years)
+    inv_shocks = np.random.normal(a.investment_return - a.investment_fee,
+                                  a.investment_return_std, max_years)
     house_shocks = np.random.normal(a.house_appreciation, a.house_appreciation_std, max_years)
     rent_shocks = np.random.normal(a.rent_growth, a.rent_growth_std, max_years)
     

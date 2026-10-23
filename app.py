@@ -54,9 +54,14 @@ mode = sb.radio("📊 Analysis mode", ("Deterministic", "Monte Carlo"), horizont
 
 with sb.expander("🏡 Property", expanded=True):
     house_price = st.slider("House price (£)", 150_000, 2_500_000, 600_000, 10_000)
-    deposit_pct = st.slider("Deposit (%)", 5, 60, 20, 1) / 100
-    mortgage_rate = st.slider("Mortgage rate (%)", 0.5, 9.0, 4.5, 0.1) / 100
-    term = st.slider("Mortgage term (yrs)", 10, 40, 30, 1)
+    deposit_pct = st.slider("Deposit (%)", 5, 100, 20, 1,
+                            help="Set to 100% for a cash purchase with no mortgage") / 100
+    cash_purchase = deposit_pct >= 1.0
+    if cash_purchase:
+        st.caption("💷 Cash purchase: no mortgage, so rate and term are ignored.")
+    mortgage_rate = st.slider("Mortgage rate (%)", 0.5, 9.0, 4.5, 0.1,
+                              disabled=cash_purchase) / 100
+    term = st.slider("Mortgage term (yrs)", 10, 40, 30, 1, disabled=cash_purchase)
     appreciation = st.slider("House appreciation (%/yr)", -2.0, 10.0, 3.0, 0.25) / 100
     ftb = st.checkbox("First-time buyer (SDLT relief)", value=False)
     addl = st.checkbox("Additional property (+5% SDLT)", value=False)

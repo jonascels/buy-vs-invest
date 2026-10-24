@@ -11,8 +11,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from model import (Assumptions, StochasticAssumptions, run_model,
-                   run_monte_carlo, stamp_duty, summarise)
+import rates as boe
+from model import (Assumptions, StochasticAssumptions, monthly_mortgage_payment,
+                   run_model, run_monte_carlo, stamp_duty, summarise)
 
 st.set_page_config(page_title="Buy vs Invest", page_icon="🏠", layout="wide")
 
@@ -45,6 +46,19 @@ st.caption(
     "investing the deposit plus any monthly cash-flow difference. All figures GBP."
 )
 
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Fetching live mortgage rates…")
+def load_live_rates():
+    """Bank of England monthly mortgage rates, or None if unreachable."""
+    try:
+        return boe.fetch_boe_rates()
+    except Exception:
+        return None
+
+
+live_df = load_live_rates()
+
 # ------------------------------------------------------------------ sidebar
 sb = st.sidebar
 sb.header("Assumptions")
@@ -59,8 +73,28 @@ with sb.expander("🏡 Property", expanded=True):
     cash_purchase = deposit_pct >= 1.0
     if cash_purchase:
         st.caption("💷 Cash purchase: no mortgage, so rate and term are ignored.")
-    mortgage_rate = st.slider("Mortgage rate (%)", 0.5, 9.0, 4.5, 0.1,
-                              disabled=cash_purchase) / 100
+    fixed_years = st.selectbox(
+        "Fixed-rate period", boe.FIXED_PERIODS, index=2,
+        format_func=lambda y: f"{y}-year fix", disabled=cash_purchase,
+        help="How long the rate is locked. In Monte Carlo mode you remortgage "
+             "at the market rate at the end of each fixed period.")
+    ltv_pct = (1 - deposit_pct) * 100
+    live_code = boe.best_series(fixed_years, ltv_pct)
+    live = boe.latest_rate(live_df, live_code) if live_df is not None else None
+    use_live = st.toggle("Use live Bank of England rate", value=live is not None,
+                         disabled=cash_purchase or live is None)
+    if use_live and live is not None:
+        live_rate, live_month = live
+        st.caption(f"📡 {boe.SERIES_BY_CODE[live_code].label}: "
+                   f"**{live_rate * 100:.2f}%** ({live_month:%b %Y} average, "
+                   f"excludes product fees)")
+        default_rate = min(max(round(live_rate * 100, 2), 0.5), 9.0)
+    else:
+        if live is None and not cash_purchase:
+            st.caption("Live rates unavailable right now, so set the rate manually.")
+        default_rate = 4.5
+    mortgage_rate = st.slider("Mortgage rate (%)", 0.5, 9.0, default_rate, 0.01,
+                              disabled=cash_purchase or use_live) / 100
     term = st.slider("Mortgage term (yrs)", 10, 40, 30, 1, disabled=cash_purchase)
     appreciation = st.slider("House appreciation (%/yr)", -2.0, 10.0, 3.0, 0.25) / 100
     ftb = st.checkbox("First-time buyer (SDLT relief)", value=False)
@@ -94,12 +128,102 @@ if mode == "Monte Carlo":
     sb.subheader("🎲 Monte Carlo options")
     n_sims = sb.slider("Number of simulations", 10, 1_000, 100, 10,
                        help="More sims = more accurate but slower")
-    sb.write(f"⏱️ ~{n_sims * 0.025:.1f}s estimated runtime")
+    sb.write(f"⏱️ ~{max(n_sims * 0.012, 0.1):.1f}s estimated runtime")
     
     with sb.expander("📊 Volatility assumptions", expanded=False):
         inv_vol = st.slider("Investment volatility (%/yr)", 1.0, 30.0, 12.0, 0.5) / 100
         house_vol = st.slider("House price volatility (%/yr)", 1.0, 20.0, 8.0, 0.5) / 100
         rent_vol = st.slider("Rent growth volatility (%/yr)", 0.0, 5.0, 2.0, 0.1) / 100
+
+    with sb.expander("🏦 Mortgage rate risk", expanded=False):
+        hist_vol = boe.annual_change_std(live_df, boe.HEADLINE[fixed_years]) \
+            if live_df is not None else None
+        rate_vol = st.slider(
+            "Mortgage rate volatility (pp/yr)", 0.0, 3.0,
+            round(hist_vol * 100, 1) if hist_vol else 1.0, 0.1,
+            disabled=cash_purchase,
+            help="Typical size of a one-year move in market mortgage rates. "
+                 "Default comes from the last 15 years of Bank of England data."
+        ) / 100
+        long_run_rate = st.slider(
+            "Long-run mortgage rate (%)", 1.0, 9.0,
+            min(max(round(mortgage_rate * 100, 1), 1.0), 9.0), 0.1,
+            disabled=cash_purchase,
+            help="Rates drift back towards this level over time. "
+                 "Defaults to today's rate (no expected rise or fall).") / 100
+        if hist_vol and not cash_purchase:
+            st.caption(f"Historical 1-year moves: ±{hist_vol * 100:.1f}pp "
+                       f"(1 std dev, {fixed_years}-year fix).")
+
+# ------------------------------------------------------------------ live rates
+FIX_COLOURS = {2: "#8e24aa", 3: "#00897b", 5: "#3949ab", 10: "#6d4c41"}
+
+with st.expander("📡 Live UK mortgage rates: compare fixed periods",
+                 expanded=False):
+    if live_df is None:
+        st.warning("Couldn't reach the Bank of England database just now. "
+                   "The model still works with a manual rate.")
+    else:
+        loan_amt = house_price * (1 - deposit_pct)
+        st.caption(
+            f"Average quoted rates from the Bank of England, 75% LTV "
+            f"(your loan is {ltv_pct:.0f}% LTV). Payments are for your "
+            f"£{loan_amt:,.0f} loan over {term} years. Rates exclude product fees, "
+            f"so the best deals on the market can be lower.")
+        cols = st.columns(len(boe.FIXED_PERIODS))
+        rows = []
+        latest = boe.latest_table(live_df).set_index("code")
+        for col, fy in zip(cols, boe.FIXED_PERIODS):
+            code = boe.HEADLINE[fy]
+            if code not in latest.index:
+                continue
+            r = latest.loc[code]
+            rate = r["Rate (%)"] / 100
+            pmt = monthly_mortgage_payment(loan_amt, rate, term)
+            change = r["12-month change (pp)"]
+            col.metric(f"{fy}-year fix", f"{rate * 100:.2f}%",
+                       delta=None if pd.isna(change) else f"{change:+.2f}pp vs last year",
+                       delta_color="inverse")
+            col.caption(f"£{pmt:,.0f}/month · {r['As of']}")
+            rows.append({
+                "Fixed period": f"{fy} years",
+                "Rate (%)": f"{rate * 100:.2f}",
+                "Monthly payment": f"£{pmt:,.0f}",
+                "Paid during the fix": f"£{pmt * 12 * fy:,.0f}",
+                "Certainty": f"Payment locked for {fy} years",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        hist = live_df[live_df.index >= live_df.index[-1] - pd.DateOffset(years=10)]
+        fig_live = go.Figure()
+        for fy in boe.FIXED_PERIODS:
+            code = boe.HEADLINE[fy]
+            if code in hist:
+                fig_live.add_trace(go.Scatter(
+                    x=hist.index, y=hist[code], name=f"{fy}-year fix",
+                    mode="lines", line=dict(color=FIX_COLOURS[fy], width=2),
+                    hovertemplate=f"{fy}-yr fix: %{{y:.2f}}%<extra></extra>"))
+        if "IUMTLMV" in hist:
+            fig_live.add_trace(go.Scatter(
+                x=hist.index, y=hist["IUMTLMV"], name="Standard variable rate",
+                mode="lines", line=dict(color="#9e9e9e", width=2, dash="dot"),
+                hovertemplate="SVR: %{y:.2f}%<extra></extra>"))
+        fig_live.update_layout(
+            template="plotly_white", height=320, hovermode="x unified",
+            margin=dict(l=10, r=10, t=10, b=10),
+            legend=dict(orientation="h", y=1.1), yaxis_title="Rate (%)",
+            font=dict(size=11, color="#333333"),
+            paper_bgcolor="white", plot_bgcolor="#fafafa")
+        st.plotly_chart(fig_live, use_container_width=True)
+
+        with st.popover("All published rates (by LTV)"):
+            show_lt = latest.reset_index(drop=True).copy()
+            show_lt["Rate (%)"] = show_lt["Rate (%)"].map("{:.2f}".format)
+            show_lt["12-month change (pp)"] = show_lt["12-month change (pp)"].map(
+                lambda x: "" if pd.isna(x) else f"{x:+.2f}")
+            st.dataframe(show_lt, hide_index=True)
+        st.caption(f"Source: [Bank of England Database]({boe.SOURCE_PAGE}) · "
+                   "refreshed every 6 hours.")
 
 # ------------------------------------------------------------------ run
 if mode == "Deterministic":
@@ -235,6 +359,8 @@ else:  # Monte Carlo mode
         monthly_rent=rent, rent_growth=rent_growth, rent_growth_std=rent_vol,
         investment_return=inv_return, investment_fee=inv_fee,
         investment_return_std=inv_vol,
+        mortgage_rate_std=rate_vol, fixed_period_years=fixed_years,
+        mortgage_rate_long_run=long_run_rate,
         capital_gains_tax=cgt,
         inflation=inflation,
     )
@@ -374,6 +500,63 @@ else:  # Monte Carlo mode
     st.plotly_chart(fig_fan, use_container_width=True)
     
     st.caption("📊 Box = 25th to 75th percentile (interquartile range). Whisker = full range. Line inside box = median. Cross = mean.")
+
+    if not cash_purchase:
+        st.divider()
+        st.subheader("Mortgage rate risk")
+        rb = pct_df.attrs["rates"]
+        left, right = st.columns(2)
+        with left:
+            f_rate = go.Figure()
+            f_rate.add_trace(go.Scatter(
+                x=rb["Year"], y=rb["Paid rate p90"] * 100, name="90th %ile",
+                line=dict(width=0, shape="hv"), showlegend=False,
+                hovertemplate="Yr %{x}<br>90th: %{y:.2f}%<extra></extra>"))
+            f_rate.add_trace(go.Scatter(
+                x=rb["Year"], y=rb["Paid rate p10"] * 100, name="10th–90th %ile",
+                line=dict(width=0, shape="hv"), fill="tonexty",
+                fillcolor="rgba(30, 136, 229, 0.2)",
+                hovertemplate="Yr %{x}<br>10th: %{y:.2f}%<extra></extra>"))
+            f_rate.add_trace(go.Scatter(
+                x=rb["Year"], y=rb["Paid rate p50"] * 100, name="Median",
+                line=dict(color="#1e88e5", width=3, shape="hv"),
+                hovertemplate="Yr %{x}<br>Median: %{y:.2f}%<extra></extra>"))
+            f_rate.update_layout(
+                template="plotly_white", height=320, hovermode="x unified",
+                title=dict(text="Rate you pay", font=dict(size=13)),
+                margin=dict(l=10, r=10, t=40, b=10),
+                legend=dict(orientation="h", y=-0.2),
+                xaxis_title="Years", yaxis_title="Rate (%)",
+                font=dict(size=11, color="#333333"),
+                paper_bgcolor="white", plot_bgcolor="#fafafa")
+            st.plotly_chart(f_rate, use_container_width=True)
+        with right:
+            f_pmt = go.Figure()
+            f_pmt.add_trace(go.Scatter(
+                x=rb["Year"], y=rb["Payment p90"], name="90th %ile",
+                line=dict(width=0, shape="hv"), showlegend=False,
+                hovertemplate="Yr %{x}<br>90th: £%{y:,.0f}<extra></extra>"))
+            f_pmt.add_trace(go.Scatter(
+                x=rb["Year"], y=rb["Payment p10"], name="10th–90th %ile",
+                line=dict(width=0, shape="hv"), fill="tonexty",
+                fillcolor="rgba(30, 136, 229, 0.2)",
+                hovertemplate="Yr %{x}<br>10th: £%{y:,.0f}<extra></extra>"))
+            f_pmt.add_trace(go.Scatter(
+                x=rb["Year"], y=rb["Payment p50"], name="Median",
+                line=dict(color="#1e88e5", width=3, shape="hv"),
+                hovertemplate="Yr %{x}<br>Median: £%{y:,.0f}<extra></extra>"))
+            f_pmt.update_layout(
+                template="plotly_white", height=320, hovermode="x unified",
+                title=dict(text="Monthly mortgage payment", font=dict(size=13)),
+                margin=dict(l=10, r=10, t=40, b=10),
+                legend=dict(orientation="h", y=-0.2),
+                xaxis_title="Years", yaxis_title="£ per month",
+                font=dict(size=11, color="#333333"),
+                paper_bgcolor="white", plot_bgcolor="#fafafa")
+            st.plotly_chart(f_pmt, use_container_width=True)
+        st.caption(f"🏦 Your rate is locked for {fixed_years} years at a time, then "
+                   "you remortgage at whatever the market rate is. The steps show "
+                   "each remortgage. Shaded = 80% of simulated paths.")
     
     # Percentile table
     st.divider()
@@ -413,11 +596,19 @@ with st.expander("ℹ️ How this works & caveats"):
 **Monte Carlo mode:**
 - Runs N independent paths with returns sampled from normal distributions.
 - House price, investment returns, and rent growth each vary year-to-year.
+- Mortgage rates move year-to-year too (a random walk that drifts back to a
+  long-run level). Your rate is locked for the fixed period, then you
+  remortgage at the market rate for the remaining term.
 - **Uncertainty ranges** (filled area) show 10th to 90th percentile outcomes (80% of paths).
 - **Median** (bold line) shows the middle outcome.
 - **Box plots** show the full distribution at 5-year intervals.
 - **Win probability** shows % of simulations where each strategy wins.
 - Useful for stress-testing and understanding range of outcomes.
+
+**Live mortgage rates:**
+- Monthly average quoted rates from the Bank of England, by fixed period and
+  loan-to-value. They exclude product fees and lag by about a month.
+- In deterministic mode the chosen rate is assumed to apply for the whole term.
 
 **Both modes:**
 - Both renter and owner pay council tax. Rent and house prices grow at their own rates.

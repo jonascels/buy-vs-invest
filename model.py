@@ -280,38 +280,117 @@ class StochasticAssumptions(Assumptions):
     house_appreciation_std: float = 0.08  # annual volatility in house prices
     rent_growth_std: float = 0.02        # annual volatility in rent
 
+    # Mortgage rate risk: the rate is fixed for `fixed_period_years`, then the
+    # loan is remortgaged at whatever the market rate is by then. The market
+    # rate follows a mean-reverting random walk with annual steps.
+    mortgage_rate_std: float = 0.01      # std dev of 1-year change (1.0pp)
+    fixed_period_years: int = 5          # remortgage every N years
+    mortgage_rate_long_run: float | None = None  # None -> today's rate
+    mortgage_rate_reversion: float = 0.2  # share of gap to long run closed per yr
+    mortgage_rate_floor: float = 0.005
+
+
+def market_rate_path(a: StochasticAssumptions, shocks: np.ndarray) -> np.ndarray:
+    """Market mortgage rate at the start of each year (index 0 = today).
+
+    shocks[y] is the random part of the move into year y (shocks[0] unused).
+    """
+    long_run = a.mortgage_rate if a.mortgage_rate_long_run is None \
+        else a.mortgage_rate_long_run
+    rates = np.empty(len(shocks))
+    rates[0] = a.mortgage_rate
+    for y in range(1, len(shocks)):
+        r = rates[y - 1] + a.mortgage_rate_reversion * (long_run - rates[y - 1])
+        rates[y] = max(r + shocks[y], a.mortgage_rate_floor)
+    return rates
+
+
+def paid_rate_by_month(market_rates: np.ndarray, fixed_period_years: int
+                       ) -> np.ndarray:
+    """The rate the borrower actually pays each month.
+
+    It is locked at the market rate at the start of each fixed period and
+    held until the next remortgage.
+    """
+    years = len(market_rates)
+    fp = max(int(fixed_period_years), 1)
+    locked = np.array([market_rates[(y // fp) * fp] for y in range(years)])
+    return np.repeat(locked, 12)
+
+
+def _variable_rate_schedule(principal: float, monthly_rates: np.ndarray,
+                            term_years: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Payments and end-of-month balances when the rate can change.
+
+    Whenever the rate changes the payment is recalculated so the remaining
+    balance still clears by the end of the original term. With a constant
+    rate this matches `_amortisation_schedule`.
+    """
+    months = len(monthly_rates)
+    term_months = term_years * 12
+    payments = np.zeros(months)
+    balances = np.zeros(months)
+    balance = principal
+    pmt = 0.0
+    prev_rate = None
+    for m in range(months):
+        rate = monthly_rates[m]
+        if balance <= 0 or m >= term_months:
+            balances[m] = max(balance, 0.0)
+            continue
+        if rate != prev_rate:
+            pmt = _payment_for_months(balance, rate, term_months - m)
+            prev_rate = rate
+        interest = balance * rate / 12
+        principal_paid = min(pmt - interest, balance)
+        payments[m] = interest + principal_paid
+        balance = max(balance - principal_paid, 0.0)
+        balances[m] = balance
+    return payments, balances
+
+
+def _payment_for_months(principal: float, annual_rate: float, n: int) -> float:
+    r = annual_rate / 12.0
+    if r == 0:
+        return principal / n
+    return principal * r * (1 + r) ** n / ((1 + r) ** n - 1)
+
 
 def run_model_stochastic(a: StochasticAssumptions, seed: int | None = None
                         ) -> pd.DataFrame:
     """Simulate one stochastic path with normally-distributed returns.
-    
+
     Returns monthly_df with house_value, portfolio_value, etc.
     """
     if seed is not None:
         np.random.seed(seed)
-    
+
     max_years = max(a.horizons)
     months = max_years * 12
-    
+
     # Draw annual shocks for each path
     inv_shocks = np.random.normal(a.investment_return - a.investment_fee,
                                   a.investment_return_std, max_years)
     house_shocks = np.random.normal(a.house_appreciation, a.house_appreciation_std, max_years)
     rent_shocks = np.random.normal(a.rent_growth, a.rent_growth_std, max_years)
-    
+    rate_shocks = np.random.normal(0.0, a.mortgage_rate_std, max_years)
+
     # Expand annual shocks to monthly (constant within each year)
     inv_monthly = np.repeat(inv_shocks, 12) / 12
     house_monthly = np.repeat(house_shocks, 12) / 12
     rent_monthly = np.repeat(rent_shocks, 12) / 12
-    
+
     deposit = a.house_price * a.deposit_pct
     loan = a.house_price - deposit
     sdlt = stamp_duty(a.house_price, a.first_time_buyer, a.additional_property)
     upfront_purchase_costs = deposit + sdlt + a.legal_survey_fixed
-    
-    sched = _amortisation_schedule(loan, a.mortgage_rate,
-                                   a.mortgage_term_years, months)
-    
+
+    # Mortgage: market rate path, locked for each fixed period
+    market_rates = market_rate_path(a, rate_shocks)
+    paid_rates = paid_rate_by_month(market_rates, a.fixed_period_years)
+    payments, balances = _variable_rate_schedule(loan, paid_rates,
+                                                 a.mortgage_term_years)
+
     # Monthly inflation (constant, not stochastic)
     g_infl = (1 + a.inflation) ** (1 / 12) - 1
     
@@ -331,9 +410,8 @@ def run_model_stochastic(a: StochasticAssumptions, seed: int | None = None
         
         house_value *= (1 + g_house_m)
         
-        row = sched.loc[m - 1]
-        mortgage_pmt = row["payment"]
-        loan_balance = row["balance"]
+        mortgage_pmt = payments[m - 1]
+        loan_balance = balances[m - 1]
         
         # property running costs
         maint = house_value * a.maintenance_pct / 12
@@ -362,6 +440,8 @@ def run_model_stochastic(a: StochasticAssumptions, seed: int | None = None
             "loan_balance": loan_balance,
             "home_equity": house_value - loan_balance,
             "mortgage_payment": mortgage_pmt,
+            "mortgage_rate": paid_rates[m - 1] if loan > 0 else 0.0,
+            "market_mortgage_rate": market_rates[(m - 1) // 12],
             "maintenance": maint,
             "insurance": ins,
             "buy_outgoing": buy_monthly_outgoing,
@@ -413,12 +493,20 @@ def run_monte_carlo(a: StochasticAssumptions, n_sims: int = 100
     - percentile_bounds: 10th/50th/90th percentiles by horizon
     - win_summary: % of paths where buy/invest wins
     - buy_outcomes, invest_outcomes: dicts of lists for each horizon
+
+    percentile_bounds.attrs["rates"] holds yearly 10th/50th/90th percentiles of
+    the market mortgage rate, the rate actually paid and the monthly payment.
     """
     buy_outcomes = {h: [] for h in a.horizons}
     invest_outcomes = {h: [] for h in a.horizons}
+    yearly = slice(0, None, 12)  # first month of each year
+    market_paths, paid_paths, pmt_paths = [], [], []
     
     for sim in range(n_sims):
         df = run_model_stochastic(a, seed=None)
+        market_paths.append(df["market_mortgage_rate"].values[yearly])
+        paid_paths.append(df["mortgage_rate"].values[yearly])
+        pmt_paths.append(df["mortgage_payment"].values[yearly])
         for h in a.horizons:
             idx = min(h * 12, len(df)) - 1
             buy_outcomes[h].append(df.iloc[idx]["buy_net_worth"])
@@ -451,5 +539,13 @@ def run_monte_carlo(a: StochasticAssumptions, n_sims: int = 100
             "Invest wins (%)": 100 - buy_win_pct,
         })
     
-    return (pd.DataFrame(percentile_rows), pd.DataFrame(win_rows),
-            buy_outcomes, invest_outcomes)
+    pct_df = pd.DataFrame(percentile_rows)
+    rates = {"Year": np.arange(max(a.horizons))}
+    for name, paths in (("Market rate", market_paths), ("Paid rate", paid_paths),
+                        ("Payment", pmt_paths)):
+        arr = np.array(paths)
+        for q in (10, 50, 90):
+            rates[f"{name} p{q}"] = np.percentile(arr, q, axis=0)
+    pct_df.attrs["rates"] = pd.DataFrame(rates)
+
+    return (pct_df, pd.DataFrame(win_rows), buy_outcomes, invest_outcomes)

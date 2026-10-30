@@ -12,17 +12,18 @@ family member, so the deployed app must stay simple to use.
 |---|---|
 | `model.py` | Pure-Python engine, no Streamlit imports. Deterministic + Monte Carlo. |
 | `app.py` | Streamlit UI: sidebar inputs, Plotly charts, CSV export. |
+| `lab.py` | Streamlit UI for the Mortgage lab tab (deposit sweep, custom scenarios). |
 | `rates.py` | Live UK mortgage rates from the Bank of England database (no Streamlit). |
-| `test_model.py` | Pytest sanity tests. Run `pytest -q` before committing. |
+| `test_model.py` | Pytest sanity tests. Run `python -m pytest -q` in the env before committing. |
 | `.streamlit/config.toml` | Light theme. Theming lives here, **not** in CSS. |
-| `environment.yml` | Conda env `buy-vs-invest` (py3.12, numpy, pandas, streamlit, plotly). |
+| `environment.yml` | Conda env `buy-vs-invest` (py3.12, numpy, pandas, pytest, streamlit, plotly). |
 | `.claude/launch.json` | Lets Claude Code's browser pane start the app. |
 
 ## Run
 ```bash
 conda activate buy-vs-invest
 streamlit run app.py
-pytest -q
+python -m pytest -q
 ```
 
 ## Model logic (key assumptions)
@@ -63,6 +64,26 @@ pytest -q
 - Outputs: win-probability cards, filled 10th–90th percentile bands with
   median lines, box plots per horizon, percentile + win-rate tables.
 
+## Mortgage lab (second tab)
+- Engine: `Scenario`, `simulate_scenario`, `run_scenarios`, `compare_scenarios` in
+  `model.py`. NumPy-vectorised across sims, about 10 ms per 1,000 paths per
+  scenario, so the tab recalculates on every edit with no run button.
+- **Fair comparison**: every scenario gets the same cash pot and monthly budget
+  (budget grows with inflation). Unspent cash is invested on day one; monthly
+  surplus is invested. Scenarios share shocks (`draw_shocks`), so path-by-path
+  differences and "chance best" are meaningful. Rent isn't in this comparison.
+- **Interest-only**: balance stays flat and falls due at the end of the term,
+  paid from investments net of CGT. If cash runs out, the shortfall becomes a
+  funding-gap debt at the paid mortgage rate, cleared by later surpluses and
+  reported as "Ran out of cash (%)". Rate = live rate + a user premium
+  (default 0.25pp, our assumption: the BoE doesn't publish interest-only rates).
+- Each deposit uses its own LTV band rate, which only varies for 2- and 5-yr
+  fixes. No series above 90% LTV, so 5% deposits may look too cheap.
+- `render_lab` is an `@st.fragment`, so lab edits don't re-run the first tab.
+- Scenarios last for the browser session; there's no save or load yet.
+- Volatility sliders are always in the sidebar because both tabs use them.
+- Lab colours are the dataviz skill's reference categorical palette, in order.
+
 ## UI decisions the owner has made (don't undo without asking)
 - Light theme via `config.toml`. Heavy `!important` CSS overrides broke table
   rendering; keep CSS minimal.
@@ -77,6 +98,7 @@ pytest -q
 - Simulation loops are pure Python with `iterrows`; vectorising across sims
   with NumPy would make 1,000+ sims near-instant.
 - No correlation between asset shocks (e.g. rates vs house prices).
+- Lender rules (max LTV for interest-only, affordability) aren't enforced.
 - No remortgage fees, overpayments, ISA/pension tax wrappers, or rental income.
 - MC grows assets with simple `rate/12` monthly steps while deterministic
   compounds, so zero-vol MC net worth sits slightly below deterministic.
@@ -90,6 +112,8 @@ Intended for Streamlit Community Cloud from this repo (`app.py`, branch
 settings.
 
 ## Changelog
+- **2026-10-30** — Mortgage lab tab: best-deposit sweep, repayment vs
+  interest-only, and custom scenarios plotted against each other.
 - **2026-10-24** — Live BoE mortgage rates (sidebar toggle + fixed-period
   comparison panel); stochastic mortgage rates with remortgaging every fixed
   period in MC, plus rate/payment band charts; stale zip removed.

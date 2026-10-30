@@ -6,6 +6,7 @@ dependencies:
   - python=3.12
   - numpy>=1.26
   - pandas>=2.0
+  - pytest
   - pip
   - pip:
     - streamlit>=1.40

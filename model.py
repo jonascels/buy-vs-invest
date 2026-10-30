@@ -549,3 +549,210 @@ def run_monte_carlo(a: StochasticAssumptions, n_sims: int = 100
     pct_df.attrs["rates"] = pd.DataFrame(rates)
 
     return (pct_df, pd.DataFrame(win_rows), buy_outcomes, invest_outcomes)
+
+
+# ========================================================================== #
+# Scenario lab: compare ways of financing the same house
+# ========================================================================== #
+#
+# Every scenario starts with the same cash pot and the same monthly budget, so
+# differences come only from how the house is financed. Cash not used upfront
+# is invested on day one; each month the budget pays the housing costs and any
+# surplus is invested. Paths share random shocks, so scenarios can be compared
+# path by path. Vectorised across sims (one array operation per month).
+
+REPAYMENT = "repayment"
+INTEREST_ONLY = "interest_only"
+
+
+@dataclass
+class Scenario:
+    name: str
+    deposit_pct: float
+    mortgage_rate: float
+    repayment_type: str = REPAYMENT
+    fixed_period_years: int = 5
+    term_years: int = 30
+
+
+@dataclass
+class ScenarioResult:
+    """Year-end arrays are shaped (n_sims, years)."""
+    scenario: Scenario
+    upfront_cash: float
+    loan: float
+    first_payment: float
+    net_worth: np.ndarray
+    payment: np.ndarray          # monthly mortgage payment in the year's last month
+    balance: np.ndarray
+    interest_paid: np.ndarray    # cumulative
+    funding_gap: np.ndarray      # unfunded debt, after investments ran out
+    inflation_index: np.ndarray  # shape (years,)
+
+
+def upfront_cash_needed(a: Assumptions, deposit_pct: float) -> float:
+    return (a.house_price * deposit_pct + a.legal_survey_fixed
+            + stamp_duty(a.house_price, a.first_time_buyer, a.additional_property))
+
+
+def draw_shocks(a: StochasticAssumptions, n_sims: int, seed: int = 42) -> dict:
+    """Annual shocks shared by every scenario in a comparison."""
+    years = max(a.horizons)
+    rng = np.random.default_rng(seed)
+    return {
+        "inv": rng.normal(a.investment_return - a.investment_fee,
+                          a.investment_return_std, (n_sims, years)),
+        "house": rng.normal(a.house_appreciation, a.house_appreciation_std,
+                            (n_sims, years)),
+        "rate": rng.standard_normal((n_sims, years)),
+    }
+
+
+def simulate_scenario(a: StochasticAssumptions, s: Scenario, cash: float,
+                      monthly_budget: float, shocks: dict) -> ScenarioResult:
+    """Simulate one financing choice across all paths in `shocks`."""
+    upfront = upfront_cash_needed(a, s.deposit_pct)
+    if cash < upfront:
+        raise ValueError(f"{s.name}: needs £{upfront:,.0f} upfront, have £{cash:,.0f}")
+
+    n_sims, years = shocks["inv"].shape
+    months = years * 12
+    loan = a.house_price * (1 - s.deposit_pct)
+    term_months = s.term_years * 12
+    fix_months = max(s.fixed_period_years, 1) * 12
+    interest_only = s.repayment_type == INTEREST_ONLY
+    g_infl = (1 + a.inflation) ** (1 / 12) - 1
+
+    # Market rate per path; the LTV / product spread over the headline rate
+    # carries over to the long-run level.
+    long_run = a.mortgage_rate if a.mortgage_rate_long_run is None \
+        else a.mortgage_rate_long_run
+    long_run += s.mortgage_rate - a.mortgage_rate
+    market = np.empty((n_sims, years))
+    market[:, 0] = s.mortgage_rate
+    for y in range(1, years):
+        prev = market[:, y - 1]
+        market[:, y] = np.maximum(
+            prev + a.mortgage_rate_reversion * (long_run - prev)
+            + a.mortgage_rate_std * shocks["rate"][:, y],
+            a.mortgage_rate_floor)
+    locked_year = (np.arange(years) // max(s.fixed_period_years, 1)) * max(s.fixed_period_years, 1)
+    paid = market[:, locked_year]
+
+    house = np.full(n_sims, float(a.house_price))
+    balance = np.full(n_sims, float(loan))
+    portfolio = np.full(n_sims, float(cash - upfront))
+    basis = portfolio.copy()
+    gap = np.zeros(n_sims)
+    pmt = np.zeros(n_sims)
+    interest_total = np.zeros(n_sims)
+    budget = float(monthly_budget)
+    first_payment = 0.0
+
+    out = {k: np.empty((n_sims, years)) for k in
+           ("net_worth", "payment", "balance", "interest", "gap")}
+    infl = np.empty(years)
+
+    for m in range(months):
+        y = m // 12
+        rate = paid[:, y]
+        house *= 1 + shocks["house"][:, y] / 12
+        portfolio *= 1 + shocks["inv"][:, y] / 12
+        gap *= 1 + rate / 12
+
+        payment = np.zeros(n_sims)
+        lump_sum = np.zeros(n_sims)
+        if m < term_months and loan > 0:
+            interest = balance * rate / 12
+            if interest_only:
+                principal = np.zeros(n_sims)
+            else:
+                if m % fix_months == 0:
+                    r = rate / 12
+                    n = term_months - m
+                    pmt = balance * r * (1 + r) ** n / ((1 + r) ** n - 1)
+                principal = np.minimum(pmt - interest, balance)
+            payment = interest + principal
+            balance = balance - principal
+            interest_total += interest
+            if m == term_months - 1:  # whatever is left falls due at term end
+                lump_sum = balance
+                balance = np.zeros(n_sims)
+            if m == 0:
+                first_payment = float(payment[0])
+
+        running = house * (a.maintenance_pct + a.insurance_pct) / 12 \
+            + (a.service_charge + a.council_tax) / 12
+        net_cash = budget - payment - running - lump_sum
+
+        # Surplus clears any funding gap first, then is invested
+        surplus = np.maximum(net_cash, 0.0)
+        to_gap = np.minimum(surplus, gap)
+        gap -= to_gap
+        portfolio += surplus - to_gap
+        basis += surplus - to_gap
+
+        # Shortfall sells investments (grossed up for CGT), then becomes a gap
+        need = np.maximum(-net_cash, 0.0)
+        if need.any():
+            with np.errstate(divide="ignore", invalid="ignore"):
+                gain_share = np.where(portfolio > 0,
+                                      np.clip(1 - basis / portfolio, 0, 1), 0.0)
+                keep = 1 - gain_share * a.capital_gains_tax
+                taken = np.minimum(need, portfolio * keep)
+                sold = taken / keep
+                sold_share = np.where(portfolio > 0, sold / portfolio, 0.0)
+            basis *= 1 - sold_share
+            portfolio = np.maximum(portfolio - sold, 0.0)
+            gap += need - taken
+
+        budget *= 1 + g_infl
+
+        if (m + 1) % 12 == 0:
+            gain = np.maximum(portfolio - basis, 0.0)
+            out["net_worth"][:, y] = (house * (1 - a.selling_cost_pct) - balance - gap
+                                      + portfolio - gain * a.capital_gains_tax)
+            out["payment"][:, y] = payment
+            out["balance"][:, y] = balance
+            out["interest"][:, y] = interest_total
+            out["gap"][:, y] = gap
+            infl[y] = (1 + g_infl) ** (m + 1)
+
+    return ScenarioResult(s, upfront, loan, first_payment, out["net_worth"],
+                          out["payment"], out["balance"], out["interest"],
+                          out["gap"], infl)
+
+
+def run_scenarios(a: StochasticAssumptions, scenarios: List[Scenario], cash: float,
+                  monthly_budget: float, n_sims: int = 500, seed: int = 42
+                  ) -> List[ScenarioResult]:
+    shocks = draw_shocks(a, n_sims, seed)
+    return [simulate_scenario(a, s, cash, monthly_budget, shocks) for s in scenarios]
+
+
+def compare_scenarios(results: List[ScenarioResult], horizon: int,
+                      real: bool = False) -> pd.DataFrame:
+    """One row per scenario at `horizon` years, with the chance of being best."""
+    i = horizon - 1
+    wealth = np.array([
+        r.net_worth[:, i] / (r.inflation_index[i] if real else 1.0) for r in results
+    ])
+    best = wealth.argmax(axis=0)
+    rows = []
+    for k, r in enumerate(results):
+        s = r.scenario
+        rows.append({
+            "Scenario": s.name,
+            "Deposit (%)": s.deposit_pct * 100,
+            "Type": "Interest-only" if s.repayment_type == INTEREST_ONLY else "Repayment",
+            "Start rate (%)": s.mortgage_rate * 100,
+            "Cash upfront": r.upfront_cash,
+            "First payment": r.first_payment,
+            "Median net worth": np.percentile(wealth[k], 50),
+            "10th %ile": np.percentile(wealth[k], 10),
+            "90th %ile": np.percentile(wealth[k], 90),
+            "Chance best (%)": 100 * np.mean(best == k),
+            "Median interest paid": np.percentile(r.interest_paid[:, i], 50),
+            "Ran out of cash (%)": 100 * np.mean((r.funding_gap[:, :horizon] > 1).any(axis=1)),
+        })
+    return pd.DataFrame(rows)

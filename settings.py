@@ -32,6 +32,8 @@ STATIC_KEYS = [
     "sb_service", "sb_council_tax", "sb_legal", "sb_selling", "sb_rent", "sb_rent_growth",
     "sb_inv_return", "sb_inv_fee", "sb_cgt", "sb_inflation", "sb_real", "sb_n_sims",
     "sb_inv_vol", "sb_house_vol", "sb_rent_vol",
+    # buy vs invest tab
+    "trend_horizon",
     # mortgage tab
     "fin_income", "fin_savings", "fin_income_growth", "fin_cost_growth",
     "aff_step", "aff_terms", "aff_rates", "aff_rate_step", "aff_year", "aff_show",
@@ -40,7 +42,7 @@ STATIC_KEYS = [
     "hist_loan", "hist_term", "hist_years", "hist_method",
 ]
 DYNAMIC_KEYS = ["sb_rate_vol", "sb_long_run", "aff_amounts"]
-TABLES = ["fin_costs", "cmp_scenarios"]
+TABLES = ["fin_costs", "cmp_scenarios", "rent_steps"]
 
 _SNAPSHOT = "_settings_snapshot"
 _LOADED = "_settings_loaded"      # dynamic values waiting for their widget

@@ -344,3 +344,24 @@ def test_settings_rejects_other_files():
     assert settings.apply({"app": "buy-vs-invest", "widgets": {"evil": 1, "sb_ftb": True}},
                           state) == 1
     assert "evil" not in state and state["sb_ftb"] is True
+
+
+# ---- rent step-ups ----------------------------------------------------------
+
+def test_rent_step_is_indexed_from_today():
+    a = Assumptions(monthly_rent=2_000, rent_growth=0.03, rent_steps=[(5, 1_000)])
+    df = run_model(a)
+    g = (1.03) ** (1 / 12)
+    assert df["rent"].iloc[59] == pytest.approx(2_000 * g ** 59)   # last month before
+    assert df["rent"].iloc[60] == pytest.approx(3_000 * g ** 60)   # first month after
+    assert df["rent"].iloc[0] == 2_000
+
+
+def test_rent_steps_cost_the_renter():
+    base = run_model(Assumptions())
+    bigger = run_model(Assumptions(rent_steps=[(3, 800), (8, 600)]))
+    assert bigger["invest_net_worth"].iloc[-1] < base["invest_net_worth"].iloc[-1]
+    assert bigger["rent"].iloc[-1] > base["rent"].iloc[-1]
+    np.random.seed(1)
+    mc = run_model_stochastic(StochasticAssumptions(rent_steps=[(3, 800)], **NO_VOL))
+    assert mc["rent"].iloc[36] > mc["rent"].iloc[35] + 700

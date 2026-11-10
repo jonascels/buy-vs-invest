@@ -94,6 +94,9 @@ class Assumptions:
     # Rent (the alternative)
     monthly_rent: float = 2_200.0
     rent_growth: float = 0.03            # annual
+    # Moves to a bigger rented home: (years from now, extra £/month at today's
+    # prices). The extra grows with rent like the rest of it.
+    rent_steps: List[Tuple[float, float]] = field(default_factory=list)
 
     # Investment alternative
     investment_return: float = 0.07      # annual nominal (e.g. global equities)
@@ -105,6 +108,11 @@ class Assumptions:
 
     # Horizons to report
     horizons: List[int] = field(default_factory=lambda: [5, 10, 15, 20, 25, 30])
+
+
+def rent_today_prices(a: Assumptions, year: float) -> float:
+    """Monthly rent in today's money `year` years from now, after any moves."""
+    return a.monthly_rent + sum(extra for when, extra in a.rent_steps if year >= when)
 
 
 def _amortisation_schedule(principal: float, annual_rate: float,
@@ -157,7 +165,7 @@ def run_model(a: Assumptions) -> pd.DataFrame:
     # housing outgoings and their own rent.
     portfolio = upfront_purchase_costs
     invested_basis = upfront_purchase_costs  # cost basis for CGT
-    rent = a.monthly_rent
+    rent_index = 1.0  # cumulative rent growth
 
     records = []
     for m in range(1, months + 1):
@@ -166,6 +174,7 @@ def run_model(a: Assumptions) -> pd.DataFrame:
         row = sched.loc[m - 1]
         mortgage_pmt = row["payment"]
         loan_balance = row["balance"]
+        rent = rent_today_prices(a, (m - 1) / 12) * rent_index
 
         # property running costs this month
         maint = house_value * a.maintenance_pct / 12
@@ -196,6 +205,7 @@ def run_model(a: Assumptions) -> pd.DataFrame:
             "loan_balance": loan_balance,
             "home_equity": house_value - loan_balance,
             "mortgage_payment": mortgage_pmt,
+            "mortgage_interest": row["interest"],
             "maintenance": maint,
             "insurance": ins,
             "buy_outgoing": buy_monthly_outgoing,
@@ -208,7 +218,7 @@ def run_model(a: Assumptions) -> pd.DataFrame:
             "inflation_index": (1 + g_infl) ** m,
         })
 
-        rent *= (1 + g_rent)
+        rent_index *= (1 + g_rent)
 
     df = pd.DataFrame(records)
 
@@ -399,7 +409,7 @@ def run_model_stochastic(a: StochasticAssumptions, seed: int | None = None
     # --- INVEST path state ---
     portfolio = upfront_purchase_costs
     invested_basis = upfront_purchase_costs
-    rent = a.monthly_rent
+    rent_index = 1.0
     
     records = []
     for m in range(1, months + 1):
@@ -409,6 +419,7 @@ def run_model_stochastic(a: StochasticAssumptions, seed: int | None = None
         g_inv_m = inv_monthly[m - 1]
         
         house_value *= (1 + g_house_m)
+        rent = rent_today_prices(a, (m - 1) / 12) * rent_index
         
         mortgage_pmt = payments[m - 1]
         loan_balance = balances[m - 1]
@@ -454,7 +465,7 @@ def run_model_stochastic(a: StochasticAssumptions, seed: int | None = None
             "inflation_index": (1 + g_infl) ** m,
         })
         
-        rent *= (1 + g_rent_m)
+        rent_index *= (1 + g_rent_m)
     
     df = pd.DataFrame(records)
     

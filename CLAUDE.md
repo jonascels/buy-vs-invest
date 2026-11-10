@@ -48,6 +48,15 @@ python -m pytest -q
   app picks the band the user's LTV fits under (`best_series`), caches the
   fetch for 6h, and falls back to a manual slider if the BoE is unreachable.
   Deterministic mode applies the chosen rate for the whole term.
+- **Rent step-ups** (`Assumptions.rent_steps`, sidebar "Bigger home later?" table):
+  (years from now, extra £/month at today's prices). Rent each month =
+  `rent_today_prices(a, year)` x cumulative rent growth, so a step is indexed
+  from today. Applies in deterministic and Monte Carlo, so it cuts what the
+  renter can invest. The Mortgage tab doesn't use rent.
+- **Rent vs mortgage chart** (deterministic mode): rent with steps, mortgage
+  repayment, and repayment + upkeep/insurance; totals over a chosen horizon;
+  cumulative "money you don't get back" (rent vs interest + upkeep + insurance
+  + service + SDLT + legal). Replaced the old "Monthly outgoings" chart.
 - **Horizons**: `[5, 10, 15, 20, 25, 30]` years (set in `Assumptions.horizons`).
 
 ## Monte Carlo
@@ -166,6 +175,7 @@ Intended for Streamlit Community Cloud from this repo (`app.py`, branch
 settings.
 
 ## Changelog
+- **2026-11-10** — Rent vs mortgage trend chart; rent step-ups for a bigger home.
 - **2026-11-10** — Save and load settings as a file.
 - **2026-11-10** — Affordability and Mortgage lab merged into one Mortgage tab with
   shared finances (costs can start and stop); comparison simplified and now uses

@@ -19,6 +19,9 @@ from model import (Assumptions, StochasticAssumptions, monthly_mortgage_payment,
 
 st.set_page_config(page_title="Buy vs Invest", layout="wide")
 
+DEFAULT_RENT_STEPS = pd.DataFrame({"In (yrs)": pd.Series(dtype="float"),
+                                   "Extra £/month": pd.Series(dtype="float")})
+
 # Light theme - configured via .streamlit/config.toml
 st.markdown(
     """
@@ -130,6 +133,21 @@ with sb.expander("Rent (the alternative)"):
     rent = st.slider("Monthly rent (£)", 500, 8_000, 2_200, 50, key="sb_rent")
     rent_growth = st.slider("Rent growth (%/yr)", 0.0, 8.0, 3.0, 0.25,
                             key="sb_rent_growth") / 100
+    st.markdown("**Bigger home later?**")
+    st.caption("Add a row for each move, with the extra monthly rent at today's prices. "
+               "It then rises with rent growth like the rest of the rent.")
+    step_rows, step_key = settings.table("rent_steps", DEFAULT_RENT_STEPS)
+    steps_df = st.data_editor(
+        step_rows, key=step_key, num_rows="dynamic", hide_index=True, width="stretch",
+        column_config={
+            "In (yrs)": st.column_config.NumberColumn(min_value=1, max_value=30, step=1),
+            "Extra £/month": st.column_config.NumberColumn(
+                min_value=0, step=50, format="£%.0f"),
+        })
+    settings.remember_table("rent_steps", steps_df)
+    rent_steps = sorted((float(r["In (yrs)"]), float(r["Extra £/month"]))
+                        for _, r in steps_df.iterrows()
+                        if pd.notna(r["In (yrs)"]) and pd.notna(r["Extra £/month"]))
 
 with sb.expander("Investment", expanded=True):
     inv_return = st.slider("Investment return (%/yr)", 0.0, 12.0, 7.0, 0.25,
@@ -267,7 +285,7 @@ with tab_main:
             maintenance_pct=maintenance, insurance_pct=insurance,
             service_charge=service_charge, council_tax=council_tax,
             legal_survey_fixed=legal, selling_cost_pct=selling_cost,
-            monthly_rent=rent, rent_growth=rent_growth,
+            monthly_rent=rent, rent_growth=rent_growth, rent_steps=rent_steps,
             investment_return=inv_return, investment_fee=inv_fee, capital_gains_tax=cgt,
             inflation=inflation,
         )
@@ -332,9 +350,62 @@ with tab_main:
             paper_bgcolor="white", plot_bgcolor="#fafafa")
         st.plotly_chart(fig, use_container_width=True)
     
+        # ---- rent vs mortgage
+        st.subheader(f"Rent vs mortgage over time{suffix}")
+        deflate = 1 / df["inflation_index"] if real_terms else 1.0
+        upkeep = df["maintenance"] + df["insurance"] + a.service_charge / 12
+        f3 = go.Figure()
+        f3.add_trace(go.Scatter(
+            x=df["year"], y=df["rent"] * deflate, name="Rent", mode="lines",
+            line=dict(color="#f57c00", width=3, shape="hv"),
+            hovertemplate="Rent £%{y:,.0f}<extra></extra>"))
+        f3.add_trace(go.Scatter(
+            x=df["year"], y=df["mortgage_payment"] * deflate, name="Mortgage repayment",
+            mode="lines", line=dict(color="#1e88e5", width=3),
+            hovertemplate="Mortgage £%{y:,.0f}<extra></extra>"))
+        f3.add_trace(go.Scatter(
+            x=df["year"], y=(df["mortgage_payment"] + upkeep) * deflate,
+            name="Mortgage + upkeep and insurance", mode="lines",
+            line=dict(color="#1e88e5", width=2, dash="dot"),
+            hovertemplate="Mortgage + upkeep £%{y:,.0f}<extra></extra>"))
+        for when, extra in a.rent_steps:
+            f3.add_vline(x=when, line_dash="dot", line_color="#f57c00", opacity=0.6,
+                         annotation_text=f"Bigger home +{gbp(extra)}",
+                         annotation_position="top left",
+                         annotation_font=dict(size=11, color="#555555"))
+        f3.update_layout(
+            template="plotly_white", height=380, hovermode="x unified",
+            margin=dict(l=10, r=10, t=30, b=10),
+            legend=dict(orientation="h", y=1.12),
+            yaxis_title="£ per month", xaxis_title="Years",
+            font=dict(size=12, color="#333333"),
+            paper_bgcolor="white", plot_bgcolor="#fafafa")
+        st.plotly_chart(f3, use_container_width=True)
+        st.caption("Rent rises every year with rent growth, plus a step for each bigger home "
+                   "you add in the sidebar. A repayment mortgage stays flat and stops once it's "
+                   "paid off; upkeep and insurance rise with the house value. Both pay council "
+                   "tax, so it's left out.")
+
+        h = st.radio("Totals over", a.horizons, index=1, horizontal=True,
+                     format_func=lambda y: f"{y} years", key="trend_horizon")
+        window = df[df["year"] <= h]
+        w_deflate = deflate[: len(window)] if real_terms else 1.0
+        rent_total = (window["rent"] * w_deflate).sum()
+        mortgage_total = (window["mortgage_payment"] * w_deflate).sum()
+        sunk_owning = ((window["mortgage_interest"] + upkeep[: len(window)]) * w_deflate).sum() \
+            + df.attrs["sdlt"] + legal
+        t1, t2, t3 = st.columns(3)
+        t1.metric(f"Rent paid over {h} years", gbp(rent_total),
+                  help="All of it is gone: rent buys a place to live, not a share of one.")
+        t2.metric(f"Mortgage repayments over {h} years", gbp(mortgage_total),
+                  help="Part is interest; the rest pays off the loan and becomes your equity.")
+        t3.metric("Owning costs you don't get back", gbp(sunk_owning),
+                  help="Mortgage interest, upkeep, insurance and service charges, plus stamp "
+                       "duty and legal fees. Compare this with rent paid.")
+
         # ---- components
         left, right = st.columns(2)
-    
+
         with left:
             st.subheader("Buy: equity vs debt")
             f2 = go.Figure()
@@ -350,21 +421,28 @@ with tab_main:
                              font=dict(size=11, color="#333333"),
                              paper_bgcolor="white", plot_bgcolor="#fafafa")
             st.plotly_chart(f2, use_container_width=True)
-    
+
         with right:
-            st.subheader("Monthly outgoings: buy vs rent")
-            f3 = go.Figure()
-            f3.add_trace(go.Scatter(x=df["year"], y=df["buy_outgoing"], name="Buy /mo",
-                                    line=dict(color="#1e88e5")))
-            f3.add_trace(go.Scatter(x=df["year"], y=df["rent_outgoing"], name="Rent /mo",
-                                    line=dict(color="#f57c00")))
-            f3.update_layout(template="plotly_white", height=320,
+            st.subheader(f"Money you don't get back{suffix}")
+            f4 = go.Figure()
+            f4.add_trace(go.Scatter(
+                x=df["year"], y=(df["rent"] * deflate).cumsum(), name="Renting: rent",
+                line=dict(color="#f57c00"),
+                hovertemplate="Rent £%{y:,.0f}<extra></extra>"))
+            f4.add_trace(go.Scatter(
+                x=df["year"],
+                y=((df["mortgage_interest"] + upkeep) * deflate).cumsum()
+                + df.attrs["sdlt"] + legal,
+                name="Owning: interest, upkeep, stamp duty",
+                line=dict(color="#1e88e5"),
+                hovertemplate="Owning £%{y:,.0f}<extra></extra>"))
+            f4.update_layout(template="plotly_white", height=320, hovermode="x unified",
                              margin=dict(l=10, r=10, t=10, b=10),
                              legend=dict(orientation="h", y=1.1),
                              font=dict(size=11, color="#333333"),
                              paper_bgcolor="white", plot_bgcolor="#fafafa")
-            st.plotly_chart(f3, use_container_width=True)
-    
+            st.plotly_chart(f4, use_container_width=True)
+
         # ---- table
         st.subheader("Summary table")
         show = summary.copy()
@@ -389,7 +467,7 @@ with tab_main:
             maintenance_pct=maintenance, insurance_pct=insurance,
             service_charge=service_charge, council_tax=council_tax,
             legal_survey_fixed=legal, selling_cost_pct=selling_cost,
-            monthly_rent=rent, rent_growth=rent_growth, rent_growth_std=rent_vol,
+            monthly_rent=rent, rent_growth=rent_growth, rent_steps=rent_steps, rent_growth_std=rent_vol,
             investment_return=inv_return, investment_fee=inv_fee,
             investment_return_std=inv_vol,
             mortgage_rate_std=rate_vol, fixed_period_years=fixed_years,

@@ -609,8 +609,14 @@ def draw_shocks(a: StochasticAssumptions, n_sims: int, seed: int = 42) -> dict:
 
 
 def simulate_scenario(a: StochasticAssumptions, s: Scenario, cash: float,
-                      monthly_budget: float, shocks: dict) -> ScenarioResult:
-    """Simulate one financing choice across all paths in `shocks`."""
+                      monthly_budget, shocks: dict,
+                      include_running_costs: bool = True) -> ScenarioResult:
+    """Simulate one financing choice across all paths in `shocks`.
+
+    monthly_budget is a number that grows with inflation, or an array with one
+    value per month. Set include_running_costs=False when the budget is already
+    net of upkeep, insurance, council tax and service charges.
+    """
     upfront = upfront_cash_needed(a, s.deposit_pct)
     if cash < upfront:
         raise ValueError(f"{s.name}: needs £{upfront:,.0f} upfront, have £{cash:,.0f}")
@@ -646,7 +652,12 @@ def simulate_scenario(a: StochasticAssumptions, s: Scenario, cash: float,
     gap = np.zeros(n_sims)
     pmt = np.zeros(n_sims)
     interest_total = np.zeros(n_sims)
-    budget = float(monthly_budget)
+    if np.ndim(monthly_budget) == 0:
+        budgets = float(monthly_budget) * (1 + g_infl) ** np.arange(months)
+    else:
+        budgets = np.asarray(monthly_budget, dtype=float)
+        if len(budgets) < months:
+            raise ValueError(f"Budget path needs {months} months, got {len(budgets)}")
     first_payment = 0.0
 
     out = {k: np.empty((n_sims, years)) for k in
@@ -682,8 +693,8 @@ def simulate_scenario(a: StochasticAssumptions, s: Scenario, cash: float,
                 first_payment = float(payment[0])
 
         running = house * (a.maintenance_pct + a.insurance_pct) / 12 \
-            + (a.service_charge + a.council_tax) / 12
-        net_cash = budget - payment - running - lump_sum
+            + (a.service_charge + a.council_tax) / 12 if include_running_costs else 0.0
+        net_cash = budgets[m] - payment - running - lump_sum
 
         # Surplus clears any funding gap first, then is invested
         surplus = np.maximum(net_cash, 0.0)
@@ -706,8 +717,6 @@ def simulate_scenario(a: StochasticAssumptions, s: Scenario, cash: float,
             portfolio = np.maximum(portfolio - sold, 0.0)
             gap += need - taken
 
-        budget *= 1 + g_infl
-
         if (m + 1) % 12 == 0:
             gain = np.maximum(portfolio - basis, 0.0)
             out["net_worth"][:, y] = (house * (1 - a.selling_cost_pct) - balance - gap
@@ -724,10 +733,11 @@ def simulate_scenario(a: StochasticAssumptions, s: Scenario, cash: float,
 
 
 def run_scenarios(a: StochasticAssumptions, scenarios: List[Scenario], cash: float,
-                  monthly_budget: float, n_sims: int = 500, seed: int = 42
-                  ) -> List[ScenarioResult]:
+                  monthly_budget, n_sims: int = 500, seed: int = 42,
+                  include_running_costs: bool = True) -> List[ScenarioResult]:
     shocks = draw_shocks(a, n_sims, seed)
-    return [simulate_scenario(a, s, cash, monthly_budget, shocks) for s in scenarios]
+    return [simulate_scenario(a, s, cash, monthly_budget, shocks, include_running_costs)
+            for s in scenarios]
 
 
 def compare_scenarios(results: List[ScenarioResult], horizon: int,
@@ -827,15 +837,25 @@ def repayment_schedule(principal: float, rate: float, term_years: int,
                                        "principal", "balance"])
 
 
-def monthly_budget(income: float, costs: List[Tuple[float, float | None]],
-                   years: float, income_growth: float = 0.0,
-                   cost_growth: float = 0.0) -> float:
+Cost = Tuple[float, "float | None", "float | None"]
+
+
+def monthly_budget(income: float, costs: List[Cost], years: float,
+                   income_growth: float = 0.0, cost_growth: float = 0.0) -> float:
     """Money left for the mortgage each month, `years` from now.
 
-    costs: (monthly amount today, years until it stops or None for never).
+    costs: (monthly amount in today's money, years until it starts or None for
+    now, years until it stops or None for never).
     """
     left = income * (1 + income_growth) ** years
-    for amount, ends in costs:
-        if ends is None or years < ends:
+    for amount, starts, stops in costs:
+        if (starts is None or years >= starts) and (stops is None or years < stops):
             left -= amount * (1 + cost_growth) ** years
     return left
+
+
+def budget_path(income: float, costs: List[Cost], months: int,
+                income_growth: float = 0.0, cost_growth: float = 0.0) -> np.ndarray:
+    """monthly_budget for each month from now, for the scenario engine."""
+    return np.array([monthly_budget(income, costs, m / 12, income_growth, cost_growth)
+                     for m in range(months)])

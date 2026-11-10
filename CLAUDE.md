@@ -12,12 +12,14 @@ family member, so the deployed app must stay simple to use.
 |---|---|
 | `model.py` | Pure-Python engine, no Streamlit imports. Deterministic + Monte Carlo. |
 | `app.py` | Streamlit UI: sidebar inputs, Plotly charts, CSV export. |
-| `afford.py` | Streamlit UI for the Affordability tab (payment matrix by loan, rate and term). |
-| `lab.py` | Streamlit UI for the Mortgage lab tab (deposit sweep, custom scenarios). |
+| `mortgage.py` | Streamlit UI for the Mortgage tab: finances, compare mortgages, variable or fixed. |
+| `afford.py` | Finances panel and the affordability matrix (used by `mortgage.py`). |
+| `settings.py` | Save and load all inputs as a JSON file (sidebar panel). |
+| `ui.py` | Shared chart helpers, colours and `gbp` formatting. |
 | `history.py` | Historical variable vs fixed test (no Streamlit). `analysis/variable_vs_fixed.py` prints it. |
 | `rates.py` | Live UK mortgage rates from the Bank of England database (no Streamlit). |
 | `test_model.py` | Pytest sanity tests. Run `python -m pytest -q` in the env before committing. |
-| `.streamlit/config.toml` | Light theme. Theming lives here, **not** in CSS. |
+| `.streamlit/config.toml` | Light theme (theming lives here, **not** in CSS); silences the widget-state duplication warning that loading settings would trigger. |
 | `environment.yml` | Conda env `buy-vs-invest` (py3.12, numpy, pandas, pytest, streamlit, plotly). |
 | `.claude/launch.json` | Lets Claude Code's browser pane start the app. |
 
@@ -66,42 +68,44 @@ python -m pytest -q
 - Outputs: win-probability cards, filled 10th–90th percentile bands with
   median lines, box plots per horizon, percentile + win-rate tables.
 
-## Affordability (second tab)
-- Replicates the owner's Excel: monthly payment matrix with mortgage sizes as rows
-  and rates as columns, one matrix per term (default 20/25/30), plus cash needed,
-  LTV and share of savings per row. Cash needed = deposit + SDLT + legal fees.
-- Budget = take-home income minus listed costs; costs can stop after N years
-  (e.g. childcare). Cells: ✓ fits, ! within 10%, ✗ over; greyed rows need more
-  cash than savings.
+## Mortgage tab (second tab)
+One tab, a `@st.fragment` (`render_mortgage_tab`), so edits don't re-run the first
+tab. A shared **Your finances** panel (`finances_panel` -> `Finances`) feeds all
+three sections: take-home income, a costs table with optional start and stop
+years (e.g. school fees starting in 5, childcare stopping in 4), savings, pay
+rises and cost growth. Budget = income minus active costs (`monthly_budget`,
+`budget_path`). Costs are in today's money and grow from today.
+
+**What can we afford?** (`affordability_section`)
+- Replicates the owner's Excel: payment matrix with mortgage sizes as rows and
+  rates as columns, one per term (default 20/25/30), plus cash needed, LTV and
+  share of savings. Cash needed = deposit + SDLT + legal fees. Default rows start
+  at the smallest loan the savings allow.
+- Cells: ✓ fits, ! within 10%, ✗ over (kept as plain symbols so status isn't
+  colour-only); greyed rows need more cash than savings.
 - "In N years": pays a starting rate for N years, then remortgages at the column
   rate (`mortgage_scenario`, closed form). Same rate means the same payment.
-  Budget projects pay rises and cost growth.
-- Detail view: headline cards per term (payment, total interest, total repaid,
-  mortgage-free year), payment over time against the budget, balance left and
-  interest vs principal by year.
-- Engine: `mortgage_scenario`, `repayment_schedule`, `monthly_budget` in `model.py`.
+- Detail view: payment, total interest, total repaid, mortgage-free year per
+  term; payment over time against the budget; balance; interest vs principal.
 
-## Mortgage lab (third tab)
+**Compare mortgages** (`compare_section`)
 - Engine: `Scenario`, `simulate_scenario`, `run_scenarios`, `compare_scenarios` in
-  `model.py`. NumPy-vectorised across sims, about 10 ms per 1,000 paths per
-  scenario, so the tab recalculates on every edit with no run button.
-- **Fair comparison**: every scenario gets the same cash pot and monthly budget
-  (budget grows with inflation). Unspent cash is invested on day one; monthly
-  surplus is invested. Scenarios share shocks (`draw_shocks`), so path-by-path
-  differences and "chance best" are meaningful. Rent isn't in this comparison.
-- **Interest-only**: balance stays flat and falls due at the end of the term,
-  paid from investments net of CGT. If cash runs out, the shortfall becomes a
-  funding-gap debt at the paid mortgage rate, cleared by later surpluses and
-  reported as "Ran out of cash (%)". Rate = live rate + a user premium
-  (default 0.25pp, our assumption: the BoE doesn't publish interest-only rates).
-- Each deposit uses its own LTV band rate, which only varies for 2- and 5-yr
-  fixes. No series above 90% LTV, so 5% deposits may look too cheap.
-- `render_lab` is an `@st.fragment`, so lab edits don't re-run the first tab.
-- Scenarios last for the browser session; there's no save or load yet.
-- Volatility sliders are always in the sidebar because both tabs use them.
-- Lab colours are the dataviz skill's reference categorical palette, in order.
+  `model.py`, NumPy-vectorised, fixed at 1,000 sims.
+- Uses the finances: cash = savings, monthly budget = `budget_path` (so costs
+  that start or stop change it), with `include_running_costs=False` because the
+  costs list already covers upkeep and council tax.
+- Deposit sweep: every deposit from 5% to the most savings allow, repayment and
+  interest-only, sidebar fix and term; cards + one gain/loss chart vs the
+  smallest repayment deposit. Then an editable table of own options (up to 8):
+  cards, net worth bands over time and box plots. Tables sit in expanders.
+- Interest-only: balance flat, due at term end from investments net of CGT.
+  Shortfalls become funding-gap debt ("Ran out of cash %"). Rate = live rate +
+  a premium (default 0.25pp, our assumption).
+- Scenarios share shocks (`draw_shocks`), so "chance best" is path by path.
+- Each deposit uses its own LTV band rate (only 2- and 5-yr fixes vary; nothing
+  above 90% LTV).
 
-## Variable vs fixed (third section of the Mortgage lab)
+**Variable or fixed?** (`variable_vs_fixed`, method in `history.py`)
 - Tests whether variable beats rolling 2-year fixes, replaying BoE quoted rates at
   75% LTV, excl. fees. Variable deal data starts Apr 1998 (zeros in the variable
   and lifetime series are placeholders), so 30-40 years isn't possible.
@@ -112,6 +116,22 @@ python -m pytest -q
   5-year pieces). Continuous windows overlap heavily, so few are independent.
   Segment payment rises are overstated because rates leap where pieces join.
 - Results are read from data at run time, so don't hardcode conclusions in the UI.
+- Its own loan and term inputs; the finances don't apply.
+
+## Saving settings (`settings.py`)
+- "Save settings" at the top of the sidebar downloads a JSON file of every input
+  plus the costs and scenario tables; "Load settings" restores it. Nothing is
+  stored on a server.
+- **Every new input needs a stable `key` added to `STATIC_KEYS`**, or it won't be
+  saved. Inputs whose default follows other inputs use `settings.dynamic_key`
+  (long-run rate, rate volatility, mortgage size range). Editable tables use
+  `settings.table` + `settings.remember_table`.
+- The download builds its file on click from a snapshot refreshed at the end of
+  every run and every Mortgage tab fragment run (`refresh_snapshot`), so edits
+  made only inside the fragment are included.
+- Loading runs in the uploader's `on_change` callback, writing into session state
+  before widgets are created; editor keys get a version bump so tables reload.
+- A live mortgage rate isn't saved (it's re-fetched); a manual rate is.
 
 ## UI decisions the owner has made (don't undo without asking)
 - Light theme via `config.toml`. Heavy `!important` CSS overrides broke table
@@ -120,6 +140,11 @@ python -m pytest -q
   rejected).
 - Keep the **filled uncertainty band** chart.
 - Buy = blue `#1e88e5`, Invest = orange `#f57c00`.
+- No emojis or icons in the UI (labels, tabs, captions, page icon). Metric deltas
+  use `delta_arrow="off"`.
+- Mortgage tab colours are the dataviz skill's reference categorical palette, in
+  order (`ui.SERIES_COLOURS`).
+- Default house price £1M.
 
 ## Known limitations / ideas
 - `run_model` and `run_model_stochastic` duplicate most of their loop. A
@@ -141,6 +166,10 @@ Intended for Streamlit Community Cloud from this repo (`app.py`, branch
 settings.
 
 ## Changelog
+- **2026-11-10** — Save and load settings as a file.
+- **2026-11-10** — Affordability and Mortgage lab merged into one Mortgage tab with
+  shared finances (costs can start and stop); comparison simplified and now uses
+  the same budget; emojis removed; default house price £1M.
 - **2026-11-10** — Affordability tab: payment matrix by mortgage size, rate and
   term, budget check, future-year view and repayment over time.
 - **2026-11-01** — Variable vs fixed historical test added to the Mortgage lab.

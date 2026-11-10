@@ -1,6 +1,6 @@
 """
 Print the variable vs fixed history test. Run: python analysis/variable_vs_fixed.py
-The same test appears in the app's Mortgage lab. The method is in history.py.
+The same test appears in the app's Mortgage tab (Variable or fixed?). The method is in history.py.
 """
 
 import sys

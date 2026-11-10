@@ -7,3 +7,8 @@ font = "sans serif"
 
 [client]
 showErrorDetails = true
+
+[global]
+# Loaded settings are written into session state for widgets that also pass a
+# default value; that's intended, so don't warn about it.
+disableWidgetStateDuplicationWarning = true

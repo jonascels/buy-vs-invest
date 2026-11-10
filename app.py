@@ -12,12 +12,12 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import rates as boe
-from afford import render_affordability
-from lab import render_lab
+import settings
+from mortgage import render_mortgage_tab
 from model import (Assumptions, StochasticAssumptions, monthly_mortgage_payment,
                    run_model, run_monte_carlo, stamp_duty, summarise)
 
-st.set_page_config(page_title="Buy vs Invest", page_icon="🏠", layout="wide")
+st.set_page_config(page_title="Buy vs Invest", layout="wide")
 
 # Light theme - configured via .streamlit/config.toml
 st.markdown(
@@ -42,7 +42,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("🏠 Buy a home vs. keep investing")
+st.title("Buy a home vs. keep investing")
 st.caption(
     "Compares terminal net worth of buying with a mortgage against renting and "
     "investing the deposit plus any monthly cash-flow difference. All figures GBP."
@@ -63,21 +63,25 @@ live_df = load_live_rates()
 
 # ------------------------------------------------------------------ sidebar
 sb = st.sidebar
+settings.save_load_panel(sb.container())
+sb.divider()
 sb.header("Assumptions")
 
 # Toggle between deterministic and Monte Carlo
-mode = sb.radio("📊 Analysis mode", ("Deterministic", "Monte Carlo"), horizontal=False,
-                help="Applies to the Buy vs invest tab. The Mortgage lab always uses Monte Carlo.")
+mode = sb.radio("Analysis mode", ("Deterministic", "Monte Carlo"), horizontal=False,
+                key="sb_mode",
+                help="Applies to the Buy vs invest tab. The Mortgage tab always uses Monte Carlo.")
 
-with sb.expander("🏡 Property", expanded=True):
-    house_price = st.slider("House price (£)", 150_000, 2_500_000, 600_000, 10_000)
-    deposit_pct = st.slider("Deposit (%)", 5, 100, 20, 1,
+with sb.expander("Property", expanded=True):
+    house_price = st.slider("House price (£)", 150_000, 2_500_000, 1_000_000, 10_000,
+                            key="sb_house_price")
+    deposit_pct = st.slider("Deposit (%)", 5, 100, 20, 1, key="sb_deposit",
                             help="Set to 100% for a cash purchase with no mortgage") / 100
     cash_purchase = deposit_pct >= 1.0
     if cash_purchase:
-        st.caption("💷 Cash purchase: no mortgage, so rate and term are ignored.")
+        st.caption("Cash purchase: no mortgage, so rate and term are ignored.")
     fixed_years = st.selectbox(
-        "Fixed-rate period", boe.FIXED_PERIODS, index=2,
+        "Fixed-rate period", boe.FIXED_PERIODS, index=2, key="sb_fixed_years",
         format_func=lambda y: f"{y}-year fix", disabled=cash_purchase,
         help="How long the rate is locked. In Monte Carlo mode you remortgage "
              "at the market rate at the end of each fixed period.")
@@ -85,10 +89,11 @@ with sb.expander("🏡 Property", expanded=True):
     live_code = boe.best_series(fixed_years, ltv_pct)
     live = boe.latest_rate(live_df, live_code) if live_df is not None else None
     use_live = st.toggle("Use live Bank of England rate", value=live is not None,
+                         key="sb_use_live",
                          disabled=cash_purchase or live is None)
     if use_live and live is not None:
         live_rate, live_month = live
-        st.caption(f"📡 {boe.SERIES_BY_CODE[live_code].label}: "
+        st.caption(f"{boe.SERIES_BY_CODE[live_code].label}: "
                    f"**{live_rate * 100:.2f}%** ({live_month:%b %Y} average, "
                    f"excludes product fees)")
         default_rate = min(max(round(live_rate * 100, 2), 0.5), 9.0)
@@ -96,64 +101,83 @@ with sb.expander("🏡 Property", expanded=True):
         if live is None and not cash_purchase:
             st.caption("Live rates unavailable right now, so set the rate manually.")
         default_rate = 4.5
+    # Only a manual rate is saved; a live one is re-fetched
     mortgage_rate = st.slider("Mortgage rate (%)", 0.5, 9.0, default_rate, 0.01,
+                              key=None if use_live else "sb_rate",
                               disabled=cash_purchase or use_live) / 100
-    term = st.slider("Mortgage term (yrs)", 10, 40, 30, 1, disabled=cash_purchase)
-    appreciation = st.slider("House appreciation (%/yr)", -2.0, 10.0, 3.0, 0.25) / 100
-    ftb = st.checkbox("First-time buyer (SDLT relief)", value=False)
-    addl = st.checkbox("Additional property (+5% SDLT)", value=False)
+    term = st.slider("Mortgage term (yrs)", 10, 40, 30, 1, key="sb_term",
+                     disabled=cash_purchase)
+    appreciation = st.slider("House appreciation (%/yr)", -2.0, 10.0, 3.0, 0.25,
+                             key="sb_appreciation") / 100
+    ftb = st.checkbox("First-time buyer (SDLT relief)", value=False, key="sb_ftb")
+    addl = st.checkbox("Additional property (+5% SDLT)", value=False, key="sb_addl")
 
-with sb.expander("🔧 Running & transaction costs"):
-    maintenance = st.slider("Maintenance (%/yr of value)", 0.0, 3.0, 1.0, 0.1) / 100
-    insurance = st.slider("Insurance (%/yr of value)", 0.0, 1.0, 0.15, 0.05) / 100
-    service_charge = st.number_input("Service charge / ground rent (£/yr)", 0, 20_000, 0, 250)
-    council_tax = st.number_input("Council tax (£/yr)", 0, 8_000, 2_200, 100)
-    legal = st.number_input("Legal + survey (£, one-off)", 0, 15_000, 2_500, 250)
-    selling_cost = st.slider("Selling costs (% of value)", 0.0, 4.0, 1.75, 0.25) / 100
+with sb.expander("Running & transaction costs"):
+    maintenance = st.slider("Maintenance (%/yr of value)", 0.0, 3.0, 1.0, 0.1,
+                            key="sb_maintenance") / 100
+    insurance = st.slider("Insurance (%/yr of value)", 0.0, 1.0, 0.15, 0.05,
+                          key="sb_insurance") / 100
+    service_charge = st.number_input("Service charge / ground rent (£/yr)", 0, 20_000, 0, 250,
+                                     key="sb_service")
+    council_tax = st.number_input("Council tax (£/yr)", 0, 8_000, 2_200, 100,
+                                  key="sb_council_tax")
+    legal = st.number_input("Legal + survey (£, one-off)", 0, 15_000, 2_500, 250,
+                            key="sb_legal")
+    selling_cost = st.slider("Selling costs (% of value)", 0.0, 4.0, 1.75, 0.25,
+                             key="sb_selling") / 100
 
-with sb.expander("🏘️ Rent (the alternative)"):
-    rent = st.slider("Monthly rent (£)", 500, 8_000, 2_200, 50)
-    rent_growth = st.slider("Rent growth (%/yr)", 0.0, 8.0, 3.0, 0.25) / 100
+with sb.expander("Rent (the alternative)"):
+    rent = st.slider("Monthly rent (£)", 500, 8_000, 2_200, 50, key="sb_rent")
+    rent_growth = st.slider("Rent growth (%/yr)", 0.0, 8.0, 3.0, 0.25,
+                            key="sb_rent_growth") / 100
 
-with sb.expander("📈 Investment", expanded=True):
-    inv_return = st.slider("Investment return (%/yr)", 0.0, 12.0, 7.0, 0.25) / 100
-    inv_fee = st.slider("Fund fees / OCF (%/yr)", 0.0, 1.5, 0.16, 0.01) / 100
-    cgt = st.slider("Capital gains tax on exit (%)", 0, 40, 20, 1) / 100
+with sb.expander("Investment", expanded=True):
+    inv_return = st.slider("Investment return (%/yr)", 0.0, 12.0, 7.0, 0.25,
+                           key="sb_inv_return") / 100
+    inv_fee = st.slider("Fund fees / OCF (%/yr)", 0.0, 1.5, 0.16, 0.01,
+                        key="sb_inv_fee") / 100
+    cgt = st.slider("Capital gains tax on exit (%)", 0, 40, 20, 1, key="sb_cgt") / 100
 
-with sb.expander("🌍 Economy"):
-    inflation = st.slider("Inflation (%/yr)", 0.0, 8.0, 2.5, 0.25) / 100
+with sb.expander("Economy"):
+    inflation = st.slider("Inflation (%/yr)", 0.0, 8.0, 2.5, 0.25,
+                          key="sb_inflation") / 100
 
-real_terms = sb.toggle("📌 Show in real (today's £) terms", value=False)
+real_terms = sb.toggle("Show in real (today's £) terms", value=False, key="sb_real")
 
 # Monte Carlo options
 if mode == "Monte Carlo":
     sb.divider()
-    sb.subheader("🎲 Monte Carlo options")
-    n_sims = sb.slider("Number of simulations", 10, 1_000, 100, 10,
+    sb.subheader("Monte Carlo options")
+    n_sims = sb.slider("Number of simulations", 10, 1_000, 100, 10, key="sb_n_sims",
                        help="More sims = more accurate but slower")
-    sb.write(f"⏱️ ~{max(n_sims * 0.012, 0.1):.1f}s estimated runtime")
+    sb.write(f"About {max(n_sims * 0.012, 0.1):.1f}s estimated runtime")
 
 sb.divider()
-sb.subheader("🎲 Simulation risk")
-sb.caption("Used by Monte Carlo mode and the Mortgage lab.")
-with sb.expander("📊 Volatility assumptions", expanded=False):
-    inv_vol = st.slider("Investment volatility (%/yr)", 1.0, 30.0, 12.0, 0.5) / 100
-    house_vol = st.slider("House price volatility (%/yr)", 1.0, 20.0, 8.0, 0.5) / 100
-    rent_vol = st.slider("Rent growth volatility (%/yr)", 0.0, 5.0, 2.0, 0.1) / 100
+sb.subheader("Simulation risk")
+sb.caption("Used by Monte Carlo mode and the Mortgage tab.")
+with sb.expander("Volatility assumptions", expanded=False):
+    inv_vol = st.slider("Investment volatility (%/yr)", 1.0, 30.0, 12.0, 0.5,
+                        key="sb_inv_vol") / 100
+    house_vol = st.slider("House price volatility (%/yr)", 1.0, 20.0, 8.0, 0.5,
+                          key="sb_house_vol") / 100
+    rent_vol = st.slider("Rent growth volatility (%/yr)", 0.0, 5.0, 2.0, 0.1,
+                         key="sb_rent_vol") / 100
 
-with sb.expander("🏦 Mortgage rate risk", expanded=False):
+with sb.expander("Mortgage rate risk", expanded=False):
     hist_vol = boe.annual_change_std(live_df, boe.HEADLINE[fixed_years]) \
         if live_df is not None else None
+    vol_default = round(hist_vol * 100, 1) if hist_vol else 1.0
     rate_vol = st.slider(
-        "Mortgage rate volatility (pp/yr)", 0.0, 3.0,
-        round(hist_vol * 100, 1) if hist_vol else 1.0, 0.1,
+        "Mortgage rate volatility (pp/yr)", 0.0, 3.0, vol_default, 0.1,
+        key=settings.dynamic_key("sb_rate_vol", vol_default),
         disabled=cash_purchase,
         help="Typical size of a one-year move in market mortgage rates. "
              "Default comes from the last 15 years of Bank of England data."
     ) / 100
+    long_run_default = min(max(round(mortgage_rate * 100, 1), 1.0), 9.0)
     long_run_rate = st.slider(
-        "Long-run mortgage rate (%)", 1.0, 9.0,
-        min(max(round(mortgage_rate * 100, 1), 1.0), 9.0), 0.1,
+        "Long-run mortgage rate (%)", 1.0, 9.0, long_run_default, 0.1,
+        key=settings.dynamic_key("sb_long_run", long_run_default),
         disabled=cash_purchase,
         help="Rates drift back towards this level over time. "
              "Defaults to today's rate (no expected rise or fall).") / 100
@@ -161,14 +185,13 @@ with sb.expander("🏦 Mortgage rate risk", expanded=False):
         st.caption(f"Historical 1-year moves: ±{hist_vol * 100:.1f}pp "
                    f"(1 std dev, {fixed_years}-year fix).")
 
-tab_main, tab_afford, tab_lab = st.tabs(
-    ["🏠 Buy vs invest", "💷 Affordability", "🔬 Mortgage lab"])
+tab_main, tab_mortgage = st.tabs(["Buy vs invest", "Mortgage"])
 
 with tab_main:
     # ------------------------------------------------------------------ live rates
     FIX_COLOURS = {2: "#8e24aa", 3: "#00897b", 5: "#3949ab", 10: "#6d4c41"}
 
-    with st.expander("📡 Live UK mortgage rates: compare fixed periods",
+    with st.expander("Live UK mortgage rates: compare fixed periods",
                      expanded=False):
         if live_df is None:
             st.warning("Couldn't reach the Bank of England database just now. "
@@ -193,7 +216,7 @@ with tab_main:
                 change = r["12-month change (pp)"]
                 col.metric(f"{fy}-year fix", f"{rate * 100:.2f}%",
                            delta=None if pd.isna(change) else f"{change:+.2f}pp vs last year",
-                           delta_color="inverse")
+                           delta_color="inverse", delta_arrow="off")
                 col.caption(f"£{pmt:,.0f}/month · {r['As of']}")
                 rows.append({
                     "Fixed period": f"{fy} years",
@@ -275,13 +298,13 @@ with tab_main:
         for col, (_, r) in zip(cols, summary.iterrows()):
             buy = r["Buy (real)" if real_terms else "Buy net worth"]
             inv = r["Invest (real)" if real_terms else "Invest net worth"]
-            winner = "🏠 Buy" if buy >= inv else "📈 Invest"
+            winner = "Buy" if buy >= inv else "Invest"
             gap = abs(buy - inv)
             col.markdown(f"**{int(r['Horizon (yrs)'])} years**")
             col.metric(
-                f"🏆 {winner}",
+                f"{winner} wins",
                 gbp(max(buy, inv)),
-                delta=f"+{gbp(gap)} vs other",
+                delta=f"+{gbp(gap)} vs other", delta_arrow="off",
             )
             col.caption(f"Buy {gbp(buy)} · Invest {gbp(inv)}")
     
@@ -352,7 +375,7 @@ with tab_main:
         st.dataframe(show, use_container_width=True, hide_index=True)
     
         st.download_button(
-            "⬇️ Download full monthly projection (CSV)",
+            "Download full monthly projection (CSV)",
             df.to_csv(index=False).encode(),
             file_name="buy_vs_invest_deterministic.csv", mime="text/csv")
 
@@ -381,7 +404,7 @@ with tab_main:
             pct_df, win_df, buy_out, inv_out = run_monte_carlo(a, n_sims=n_sims)
             t1 = time.time()
     
-        st.success(f"✓ Completed in {t1-t0:.2f}s")
+        st.success(f"Completed in {t1-t0:.2f}s")
     
         def gbp(x: float) -> str:
             return f"£{x:,.0f}"
@@ -402,7 +425,7 @@ with tab_main:
             h = int(r["Horizon (yrs)"])
             buy_pct = r["Buy wins (%)"]
             inv_pct = r["Invest wins (%)"]
-            winner = "🏠 Buy" if buy_pct >= 50 else "📈 Invest"
+            winner = "Buy" if buy_pct >= 50 else "Invest"
             col.markdown(f"**{h} years**")
             col.metric(f"{winner}", f"{max(buy_pct, inv_pct):.0f}%")
             col.caption(f"Buy {buy_pct:.0f}% · Invest {inv_pct:.0f}%")
@@ -482,7 +505,7 @@ with tab_main:
             paper_bgcolor="white", plot_bgcolor="#fafafa")
         st.plotly_chart(fig_pct, use_container_width=True)
     
-        st.caption("💡 Blue shaded area = range of Buy outcomes (10th–90th percentile). Orange shaded area = range of Invest outcomes. Bold lines = median (50th percentile).")
+        st.caption("Blue shaded area = range of Buy outcomes (10th–90th percentile). Orange shaded area = range of Invest outcomes. Bold lines = median (50th percentile).")
     
         st.divider()
     
@@ -509,7 +532,7 @@ with tab_main:
             paper_bgcolor="white", plot_bgcolor="#fafafa")
         st.plotly_chart(fig_fan, use_container_width=True)
     
-        st.caption("📊 Box = 25th to 75th percentile (interquartile range). Whisker = full range. Line inside box = median. Cross = mean.")
+        st.caption("Box = 25th to 75th percentile (interquartile range). Whisker = full range. Line inside box = median. Cross = mean.")
 
         if not cash_purchase:
             st.divider()
@@ -564,7 +587,7 @@ with tab_main:
                     font=dict(size=11, color="#333333"),
                     paper_bgcolor="white", plot_bgcolor="#fafafa")
                 st.plotly_chart(f_pmt, use_container_width=True)
-            st.caption(f"🏦 Your rate is locked for {fixed_years} years at a time, then "
+            st.caption(f"Your rate is locked for {fixed_years} years at a time, then "
                        "you remortgage at whatever the market rate is. The steps show "
                        "each remortgage. Shaded = 80% of simulated paths.")
     
@@ -590,17 +613,13 @@ with tab_main:
         csv_win = win_df.to_csv(index=False)
         combined = f"# Percentiles\n{csv_pct}\n\n# Win rates\n{csv_win}"
         st.download_button(
-            "⬇️ Download MC summary (CSV)",
+            "Download MC summary (CSV)",
             combined.encode(),
             file_name="buy_vs_invest_monte_carlo.csv", mime="text/csv")
 
-# ------------------------------------------------------------------ affordability
-with tab_afford:
-    render_affordability(house_price, ftb, addl, legal, inflation, mortgage_rate, live_df)
-
-# ------------------------------------------------------------------ mortgage lab
-with tab_lab:
-    render_lab(
+# ------------------------------------------------------------------ mortgage
+with tab_mortgage:
+    render_mortgage_tab(
         StochasticAssumptions(
             house_price=house_price, deposit_pct=deposit_pct, mortgage_rate=mortgage_rate,
             mortgage_term_years=term, house_appreciation=appreciation,
@@ -615,12 +634,12 @@ with tab_lab:
             mortgage_rate_long_run=long_run_rate,
             capital_gains_tax=cgt, inflation=inflation,
         ),
-        fixed_years, term, real_terms, live_df, use_live,
+        ftb, addl, legal, fixed_years, term, real_terms, live_df, use_live,
     )
 
 # ---- footer / caveats
 st.divider()
-with st.expander("ℹ️ How this works & caveats"):
+with st.expander("How this works & caveats"):
     st.markdown(
         """
 **Deterministic mode:**
@@ -653,3 +672,5 @@ with st.expander("ℹ️ How this works & caveats"):
 - **Not financial advice.** This is an educational tool for scenario planning.
         """
     )
+
+settings.refresh_snapshot()

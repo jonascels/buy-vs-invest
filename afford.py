@@ -1,10 +1,11 @@
 """
-Streamlit UI for the Affordability tab: a matrix of monthly payments by loan
-size and rate, for several terms, checked against what the household can spend.
+Streamlit UI for the household's finances and the affordability matrix: monthly
+payments by loan size and rate, for several terms, checked against the budget.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date
 
 import numpy as np
@@ -13,8 +14,9 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import rates as boe
-from lab import CHART_LAYOUT, SERIES_COLOURS, gbp
-from model import monthly_budget, mortgage_scenario, repayment_schedule, stamp_duty
+import settings
+from model import budget_path, monthly_budget, mortgage_scenario, repayment_schedule
+from ui import CHART_LAYOUT, SERIES_COLOURS, gbp
 
 TERMS = [10, 15, 20, 25, 30, 35, 40]
 # Status colours with a symbol, so feasibility never relies on colour alone
@@ -22,9 +24,27 @@ STATUS = {"ok": ("#e3f4ea", "✓"), "tight": ("#fff1cc", "!"), "over": ("#fde2e1
 TIGHT = 0.9  # within 10% of the budget counts as tight
 
 DEFAULT_COSTS = pd.DataFrame([
-    {"Cost": "Bills and living costs", "£ per month": 3_000, "Stops in (yrs)": None},
-    {"Cost": "Childcare", "£ per month": 0, "Stops in (yrs)": None},
-]).astype({"£ per month": "float", "Stops in (yrs)": "float"})
+    {"Cost": "Bills and living costs", "£ per month": 3_500,
+     "Starts in (yrs)": None, "Stops in (yrs)": None},
+    {"Cost": "Childcare", "£ per month": 0, "Starts in (yrs)": None, "Stops in (yrs)": None},
+]).astype({"£ per month": "float", "Starts in (yrs)": "float", "Stops in (yrs)": "float"})
+
+
+@dataclass
+class Finances:
+    income: float
+    costs: list
+    savings: float
+    income_growth: float
+    cost_growth: float
+
+    def budget(self, years: float) -> float:
+        return monthly_budget(self.income, self.costs, years, self.income_growth,
+                              self.cost_growth)
+
+    def budget_path(self, months: int) -> np.ndarray:
+        return budget_path(self.income, self.costs, months, self.income_growth,
+                           self.cost_growth)
 
 
 def status(payment: float, budget: float) -> str:
@@ -33,11 +53,14 @@ def status(payment: float, budget: float) -> str:
     return "tight" if payment > budget * TIGHT else "ok"
 
 
-def nice_range(price: float) -> tuple[int, int]:
-    """Default loan range: about 30% to 80% of the price, in £50k steps."""
-    lo = max(int(round(price * 0.3 / 50_000)) * 50_000, 50_000)
-    hi = max(int(round(price * 0.8 / 50_000)) * 50_000, lo)
-    return lo, min(hi, int(price))
+def nice_range(price: float, upfront_fees: float, savings: float) -> tuple[int, int]:
+    """Default loan range: from the smallest loan your savings allow (or 30% of
+    the price) up to 90% of the price, in £50k steps."""
+    smallest = max(price + upfront_fees - savings, price * 0.3, 50_000)
+    lo = int(np.ceil(smallest / 50_000)) * 50_000
+    hi = int(price * 0.9 // 50_000) * 50_000
+    lo = min(lo, hi)
+    return lo, max(hi, lo)
 
 
 def matrix(amounts: np.ndarray, rate_grid: np.ndarray, term: int, year: int,
@@ -85,53 +108,69 @@ def matrix(amounts: np.ndarray, rate_grid: np.ndarray, term: int, year: int,
     return text.style.apply(lambda _: colours, axis=None), short.any()
 
 
-@st.fragment
-def render_affordability(price: float, ftb: bool, addl: bool, legal: float,
-                         inflation: float, default_rate: float, live_df) -> None:
-    """A fragment, so edits here don't re-run the other tabs."""
-    st.subheader("What can we afford?")
-    sdlt = stamp_duty(price, ftb, addl)
-    st.caption(f"Monthly repayments for different mortgage sizes, rates and terms, checked "
-               f"against what you can spend each month. Uses the house price in the sidebar "
-               f"({gbp(price)}, stamp duty {gbp(sdlt)}).")
-
-    left, right = st.columns([1, 1])
+def finances_panel(inflation: float) -> Finances:
+    """Income, costs and savings shared by every section of the Mortgage tab."""
+    left, right = st.columns([3, 2])
     with left:
-        st.markdown("**Your monthly budget**")
         income = st.number_input("Combined monthly take-home income (£)", 0, 200_000,
-                                 6_000, 100, key="aff_income")
+                                 8_500, 100, key="fin_income")
+        rows, editor_key = settings.table("fin_costs", DEFAULT_COSTS)
         costs = st.data_editor(
-            DEFAULT_COSTS, key="aff_costs", num_rows="dynamic", hide_index=True,
+            rows, key=editor_key, num_rows="dynamic", hide_index=True,
             width="stretch",
             column_config={
                 "Cost": st.column_config.TextColumn(width="medium"),
-                "£ per month": st.column_config.NumberColumn(min_value=0, step=50,
-                                                             format="£%.0f", default=0,
-                                                             width="small"),
+                "£ per month": st.column_config.NumberColumn(
+                    min_value=0, step=50, format="£%.0f", default=0, width="small",
+                    help="In today's money. It rises with costs each year."),
+                "Starts in (yrs)": st.column_config.NumberColumn(
+                    min_value=0, max_value=40, step=1, width="small",
+                    help="Leave blank if it applies now, e.g. 5 for school fees starting."),
                 "Stops in (yrs)": st.column_config.NumberColumn(
                     min_value=0, max_value=40, step=1, width="small",
                     help="Leave blank if it never stops, e.g. 4 for childcare ending."),
             })
-        cost_list = [(float(r["£ per month"]),
-                      None if pd.isna(r["Stops in (yrs)"]) else float(r["Stops in (yrs)"]))
-                     for _, r in costs.iterrows() if pd.notna(r["£ per month"])]
-        st.caption("Include everything except the mortgage, such as bills, food, "
-                   "childcare, council tax and upkeep.")
+        settings.remember_table("fin_costs", costs)
+        st.caption("List everything except the mortgage: bills, food, childcare, council "
+                   "tax, upkeep. Add rows for costs you can see coming.")
     with right:
-        st.markdown("**The mortgages to compare**")
         savings = st.number_input("Savings for deposit, stamp duty and fees (£)", 0,
-                                  20_000_000, int(min(price, 500_000)), 10_000,
-                                  key="aff_savings")
-        lo, hi = nice_range(price)
+                                  20_000_000, 400_000, 10_000, key="fin_savings")
+        g1, g2 = st.columns(2)
+        income_growth = g1.number_input("Pay rises (%/yr)", 0.0, 10.0, 2.5, 0.25,
+                                        key="fin_income_growth") / 100
+        cost_growth = g2.number_input("Costs rise (%/yr)", 0.0, 10.0,
+                                      round(inflation * 100, 2), 0.25,
+                                      key="fin_cost_growth") / 100
+
+    def years(v):
+        return None if pd.isna(v) else float(v)
+    cost_list = [(float(r["£ per month"]), years(r["Starts in (yrs)"]), years(r["Stops in (yrs)"]))
+                 for _, r in costs.iterrows() if pd.notna(r["£ per month"])]
+    fin = Finances(income, cost_list, savings, income_growth, cost_growth)
+    with right:
+        st.metric("Available for the mortgage today", gbp(fin.budget(0)) + " /month")
+    return fin
+
+
+def affordability_section(fin: Finances, price: float, sdlt: float, legal: float,
+                          default_rate: float, live_df) -> None:
+    st.caption(f"Monthly repayments for different mortgage sizes, rates and terms, checked "
+               f"against your budget. House price {gbp(price)} from the sidebar, stamp "
+               f"duty {gbp(sdlt)}.")
+    left, right = st.columns(2)
+    with left:
+        lo, hi = nice_range(price, sdlt + legal, fin.savings)
         amounts_range = st.slider("Mortgage sizes (£)", 0, int(price), (lo, hi), 10_000,
-                                  key=f"aff_amounts_{int(price)}")
+                                  key=settings.dynamic_key("aff_amounts", (lo, hi)))
         step = st.select_slider("Gap between rows (£)", [10_000, 25_000, 50_000, 100_000],
-                                100_000 if hi - lo >= 400_000 else 50_000, key="aff_step")
+                                100_000 if hi - lo >= 600_000 else 50_000, key="aff_step")
+        terms = st.multiselect("Mortgage terms (years)", TERMS, [20, 25, 30], key="aff_terms")
+    with right:
         rate_lo, rate_hi = st.slider("Interest rates (%)", 0.5, 12.0, (2.0, 8.0), 0.25,
                                      key="aff_rates")
         rate_step = st.select_slider("Gap between columns (%)", [0.25, 0.5, 1.0], 1.0,
                                      key="aff_rate_step")
-        terms = st.multiselect("Mortgage terms (years)", TERMS, [20, 25, 30], key="aff_terms")
 
     if not terms:
         st.info("Pick at least one mortgage term.")
@@ -159,24 +198,15 @@ def render_affordability(price: float, ftb: bool, addl: bool, legal: float,
             key="aff_start_rate",
             help="What you pay until then. The columns then show the rate you "
                  "remortgage at.") / 100
-    with st.expander("📈 Future years: pay rises and rising costs"):
-        g1, g2 = st.columns(2)
-        income_growth = g1.number_input("Pay rises (%/yr)", 0.0, 10.0, 2.5, 0.25,
-                                        key="aff_income_growth") / 100
-        cost_growth = g2.number_input("Costs rise (%/yr)", 0.0, 10.0,
-                                      round(inflation * 100, 2), 0.25,
-                                      key="aff_cost_growth") / 100
-
-    budget_now = monthly_budget(income, cost_list, 0)
-    budget = monthly_budget(income, cost_list, year, income_growth, cost_growth)
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Available for the mortgage today", gbp(budget_now) + " /month")
+    budget_now = fin.budget(0)
+    budget = fin.budget(year)
+    m1, m2 = st.columns(2)
     if year:
-        m2.metric(f"Available in year {year}", gbp(budget) + " /month",
-                  f"{gbp(budget - budget_now)} vs today", delta_color="normal")
+        m1.metric(f"Available for the mortgage in year {year}", gbp(budget) + " /month",
+                  f"{gbp(budget - budget_now)} vs today", delta_color="normal", delta_arrow="off")
     live = boe.latest_rate(live_df, boe.HEADLINE[5]) if live_df is not None else None
     if live:
-        m3.metric("Today's average 5-year fix", f"{live[0] * 100:.2f}%",
+        m2.metric("Today's average 5-year fix", f"{live[0] * 100:.2f}%",
                   help=f"Bank of England, 75% LTV, {live[1]:%b %Y}. Excludes fees.")
 
     if year:
@@ -186,15 +216,11 @@ def render_affordability(price: float, ftb: bool, addl: bool, legal: float,
     st.caption(f"✓ fits your budget · ! within 10% of it · ✗ over it. Greyed rows need more "
                f"than your savings. Cash needed = deposit + stamp duty + {gbp(legal)} fees.")
 
-    any_short = False
     for term in terms:
         st.markdown(f"#### {term}-year mortgage · {show.lower()}")
-        styler, short = matrix(amounts, rate_grid, term, year, start_rate, price,
-                               sdlt + legal, savings, budget, show)
-        any_short |= short
+        styler, _ = matrix(amounts, rate_grid, term, year, start_rate, price,
+                           sdlt + legal, fin.savings, budget, show)
         st.dataframe(styler, use_container_width=True)
-    if any_short:
-        st.caption("Greyed-out rows need more cash upfront than your savings.")
 
     # ---------------------------------------------------- one mortgage in detail
     st.divider()
@@ -220,15 +246,14 @@ def render_affordability(price: float, ftb: bool, addl: bool, legal: float,
         col.markdown(f"**{term} years**")
         col.metric("Monthly payment", gbp(first),
                    f"{gbp(later - first)} from year {year}" if abs(later - first) >= 1 else None,
-                   delta_color="inverse")
+                   delta_color="inverse", delta_arrow="off")
         col.metric("Total interest", gbp(sched["interest"].sum()))
         col.metric("Total repaid", gbp(sched["payment"].sum()))
         col.caption(f"Mortgage-free in {this_year + term} · "
                     f"{status(first, budget_now).replace('ok', 'fits today').replace('tight', 'tight today').replace('over', 'over budget today')}")
 
     years_axis = np.arange(0, max(terms) * 12) / 12
-    budget_line = [monthly_budget(income, cost_list, y, income_growth, cost_growth)
-                   for y in years_axis]
+    budget_line = [fin.budget(y) for y in years_axis]
 
     st.markdown("**Monthly repayment over time**")
     fig = go.Figure()
@@ -279,7 +304,7 @@ def render_affordability(price: float, ftb: bool, addl: bool, legal: float,
                           yaxis_title="£ per year", **CHART_LAYOUT)
         st.plotly_chart(fig, use_container_width=True)
 
-    with st.expander("ℹ️ How the affordability matrix works"):
+    with st.expander("How the affordability matrix works"):
         st.markdown(
             """
 - **Monthly payment:** a standard repayment mortgage, the same formula lenders use.
@@ -287,7 +312,8 @@ def render_affordability(price: float, ftb: bool, addl: bool, legal: float,
   payment if you remortgage at that rate for the rest of the term. If the rate doesn't
   change, the payment doesn't either.
 - **Your budget:** take-home income minus your costs. Pay rises and rising costs only
-  matter when you look ahead, and costs with a stop year drop out after it.
+  matter when you look ahead. Costs join in their start year and drop out after their
+  stop year.
 - **Cash needed:** deposit (price minus mortgage) + stamp duty + legal fees.
 - **Not included:** product fees, lender affordability rules (often 4 to 5 times income)
   and overpayments. **Not financial advice.**

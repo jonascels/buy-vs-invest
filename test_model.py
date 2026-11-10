@@ -244,8 +244,8 @@ def test_history_single_deals_decompose():
 
 # ---- affordability ----------------------------------------------------------
 
-from model import (balance_after, monthly_budget, mortgage_scenario,  # noqa: E402
-                   repayment_schedule)
+from model import (balance_after, budget_path, monthly_budget,  # noqa: E402
+                   mortgage_scenario, repayment_schedule)
 
 
 def test_scenario_matches_spreadsheet_figures():
@@ -281,8 +281,66 @@ def test_switch_after_term_is_paid_off():
     assert balance_after(300_000, 0.05, 20, 240) == pytest.approx(0, abs=1e-6)
 
 
-def test_monthly_budget_drops_costs_that_end():
-    costs = [(1_500, 4), (6_000, None)]
+def test_monthly_budget_costs_start_and_stop():
+    costs = [(1_500, None, 4), (6_000, None, None), (800, 3, 6)]
     assert monthly_budget(11_000, costs, 0) == 3_500
-    assert monthly_budget(11_000, costs, 5) == 5_000
-    assert monthly_budget(11_000, [(6_000, None)], 1, 0.10, 0.0) == pytest.approx(6_100)
+    assert monthly_budget(11_000, costs, 3) == 2_700   # school fees start, childcare on
+    assert monthly_budget(11_000, costs, 5) == 4_200   # childcare stopped
+    assert monthly_budget(11_000, costs, 6) == 5_000   # both stopped
+    assert monthly_budget(11_000, [(6_000, None, None)], 1, 0.10, 0.0) == pytest.approx(6_100)
+
+
+def test_budget_path_feeds_scenarios():
+    path = budget_path(9_000, [(4_000, None, None), (1_000, 2, None)], 360)
+    assert path[0] == 5_000 and path[24] == 4_000 and len(path) == 360
+    a = StochasticAssumptions(**LAB)
+    s = Scenario("x", 0.2, 0.05)
+    flat = run_scenarios(a, [s], 800_000, np.full(360, 5_000.0), n_sims=2,
+                         include_running_costs=False)[0]
+    lower = run_scenarios(a, [s], 800_000, path, n_sims=2, include_running_costs=False)[0]
+    assert lower.net_worth[0, -1] < flat.net_worth[0, -1]
+    # Without running costs the same budget leaves more to invest
+    with_costs = run_scenarios(a, [s], 800_000, np.full(360, 5_000.0), n_sims=2)[0]
+    assert with_costs.net_worth[0, -1] < flat.net_worth[0, -1]
+    with pytest.raises(ValueError):
+        run_scenarios(a, [s], 800_000, path[:12], n_sims=2)
+
+
+# ---- save and load settings -------------------------------------------------
+
+def test_settings_round_trip():
+    import json
+    import settings
+    AppTest = pytest.importorskip("streamlit.testing.v1").AppTest
+    at = AppTest.from_file("app.py", default_timeout=60).run()
+    at.slider(key="sb_house_price").set_value(800_000).run()
+    at.number_input(key="fin_income").set_value(9_100).run()
+    at.multiselect(key="aff_terms").set_value([15, 25]).run()
+    assert not at.exception
+    payload = json.loads(settings.to_json(at.session_state["_settings_snapshot"]))
+    assert payload["widgets"]["sb_house_price"] == 800_000
+    assert payload["tables"]["fin_costs"][0]["Cost"] == "Bills and living costs"
+    assert "sb_long_run" in payload["widgets"]
+    payload["tables"]["fin_costs"][0]["£ per month"] = 2_750.0
+    payload["widgets"]["sb_long_run"] = 6.5
+
+    fresh = AppTest.from_file("app.py", default_timeout=60)
+    restored = settings.apply(payload, fresh.session_state)
+    fresh.run()
+    assert not fresh.exception and restored > 20
+    assert fresh.slider(key="sb_house_price").value == 800_000
+    assert fresh.number_input(key="fin_income").value == 9_100
+    assert fresh.multiselect(key="aff_terms").value == [15, 25]
+    assert fresh.session_state["_settings_table_values"]["fin_costs"][0]["£ per month"] == 2_750
+    long_run = [s for s in fresh.slider if s.label == "Long-run mortgage rate (%)"][0]
+    assert long_run.value == 6.5
+
+
+def test_settings_rejects_other_files():
+    import settings
+    with pytest.raises(ValueError):
+        settings.apply({"app": "something-else"}, {})
+    state = {}
+    assert settings.apply({"app": "buy-vs-invest", "widgets": {"evil": 1, "sb_ftb": True}},
+                          state) == 1
+    assert "evil" not in state and state["sb_ftb"] is True

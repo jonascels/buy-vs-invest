@@ -12,6 +12,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import rates as boe
+from afford import render_affordability
 from lab import render_lab
 from model import (Assumptions, StochasticAssumptions, monthly_mortgage_payment,
                    run_model, run_monte_carlo, stamp_duty, summarise)
@@ -160,7 +161,8 @@ with sb.expander("🏦 Mortgage rate risk", expanded=False):
         st.caption(f"Historical 1-year moves: ±{hist_vol * 100:.1f}pp "
                    f"(1 std dev, {fixed_years}-year fix).")
 
-tab_main, tab_lab = st.tabs(["🏠 Buy vs invest", "🔬 Mortgage lab"])
+tab_main, tab_afford, tab_lab = st.tabs(
+    ["🏠 Buy vs invest", "💷 Affordability", "🔬 Mortgage lab"])
 
 with tab_main:
     # ------------------------------------------------------------------ live rates
@@ -591,6 +593,10 @@ with tab_main:
             "⬇️ Download MC summary (CSV)",
             combined.encode(),
             file_name="buy_vs_invest_monte_carlo.csv", mime="text/csv")
+
+# ------------------------------------------------------------------ affordability
+with tab_afford:
+    render_affordability(house_price, ftb, addl, legal, inflation, mortgage_rate, live_df)
 
 # ------------------------------------------------------------------ mortgage lab
 with tab_lab:

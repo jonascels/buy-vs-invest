@@ -1,7 +1,9 @@
 """Sanity tests for the engine. Run: pytest -q"""
 import math
 import numpy as np
+import pandas as pd
 import pytest
+import history
 import rates
 from model import (INTEREST_ONLY, REPAYMENT, Assumptions, Scenario, StochasticAssumptions,
                    _variable_rate_schedule, compare_scenarios, draw_shocks,
@@ -180,3 +182,107 @@ def test_app_runs_with_plausible_lab_results():
     assert float(gap.value.replace("£", "").replace(",", "")) < 2_000_000
     at.sidebar.radio[0].set_value("Monte Carlo").run()
     assert not at.exception
+
+
+# ---- variable vs fixed history ---------------------------------------------
+
+def _history(n=240, fix=5.0, var=4.0, bank=3.0, svr=6.0):
+    dates = pd.date_range("2000-01-31", periods=n, freq="ME")
+    col = lambda v: np.full(n, v, dtype=float) if np.isscalar(v) else np.asarray(v, float)
+    return history.prepare(pd.DataFrame({
+        "IUMBV34": col(fix), "IUMBV48": col(var), "IUMBV24": col(var),
+        "IUMTLMV": col(svr), "IUMABEDR": col(bank)}, index=dates))
+
+
+def test_history_prepare_drops_placeholder_zeros():
+    d = _history(var=[0.0] * 12 + [4.0] * 228)
+    assert len(d) == 228 and d["var2_margin"].iloc[0] == pytest.approx(0.01)
+    life = _history(n=4, var=4.0)
+    raw = pd.DataFrame({"IUMBV34": 5.0, "IUMBV48": 4.0, "IUMBV24": [4.0, 0.0, 4.0, 4.0],
+                        "IUMTLMV": 6.0, "IUMABEDR": 3.0}, index=life.index)
+    assert np.allclose(history.prepare(raw)["life_margin"], 0.01)
+
+
+def test_history_constant_rate_matches_standard_mortgage():
+    c = history.mortgage_cost(np.full((1, 300), 0.05), 300_000, 300)
+    total_paid = monthly_mortgage_payment(300_000, 0.05, 25) * 300
+    assert c["interest"][0] == pytest.approx(total_paid - 300_000)
+    assert c["jump"][0] == pytest.approx(0, abs=1e-6)
+
+
+def test_history_cheaper_variable_saves_money():
+    r = history.run_test(_history(), 10)
+    assert (r["savings"]["var2"] > 0).all()
+    assert (r["savings"]["svr"] < 0).all()
+    assert len(r["starts"]) == 240 - 120 + 1
+
+
+def test_history_fix_locks_and_variable_follows_bank_rate():
+    bank = [2.0] * 12 + [6.0] * 12 + [6.0] * 12
+    d = _history(n=36, fix=3.0, var=3.0, bank=bank, svr=5.0)
+    p = history.rate_paths(d, np.arange(36)[None, :])
+    assert (p["fix2"][0, :24] == 0.03).all()
+    assert p["var2"][0, 0] == pytest.approx(0.03)   # margin 1pp
+    assert p["var2"][0, 12] == pytest.approx(0.07)  # Bank Rate up 4pp
+    assert p["var2"][0, 24] == pytest.approx(0.03)  # new deal, margin -3pp
+    assert p["life"][0, 24] == pytest.approx(0.07)  # keeps its first margin
+
+
+def test_history_segments_stay_in_range():
+    idx = history.segment_windows(100, 10, 24, 50)
+    assert idx.shape == (50, 120) and idx.min() >= 0 and idx.max() < 100
+    assert (np.diff(idx[0, :24]) == 1).all()
+
+
+def test_history_single_deals_decompose():
+    bank = np.linspace(6.0, 2.0, 120)
+    d = _history(n=120, fix=5.0, var=bank + 1, bank=bank)
+    deals = history.single_deals(d)
+    assert (deals["bank_move"] < 0).all()
+    assert deals["gap_no_drift"].mean() < deals["gap"].mean()
+
+
+# ---- affordability ----------------------------------------------------------
+
+from model import (balance_after, monthly_budget, mortgage_scenario,  # noqa: E402
+                   repayment_schedule)
+
+
+def test_scenario_matches_spreadsheet_figures():
+    # From the owner's spreadsheet: £400k at 2% over 20 years is £2,024/month
+    s = mortgage_scenario(400_000, 0.02, 20)
+    assert round(float(s["payment"])) == 2024
+    expected = monthly_mortgage_payment(400_000, 0.02, 20) * 240 - 400_000
+    assert float(s["total_interest"]) == pytest.approx(expected)
+
+
+def test_scenario_matrix_broadcasts():
+    amounts = np.array([[400_000], [500_000]])
+    rates_ = np.array([[0.02, 0.05]])
+    s = mortgage_scenario(amounts, rates_, 25)
+    assert s["payment"].shape == (2, 2)
+    assert s["payment"][1, 1] == pytest.approx(monthly_mortgage_payment(500_000, 0.05, 25))
+
+
+def test_switch_matches_schedule_and_same_rate_changes_nothing():
+    s = mortgage_scenario(500_000, 0.07, 25, switch_year=5, start_rate=0.04)
+    sched = repayment_schedule(500_000, 0.07, 25, switch_year=5, start_rate=0.04)
+    assert float(s["payment"]) == pytest.approx(sched["payment"].iloc[60])
+    assert float(s["first_payment"]) == pytest.approx(sched["payment"].iloc[0])
+    assert float(s["total_interest"]) == pytest.approx(sched["interest"].sum())
+    assert float(s["balance"]) == pytest.approx(sched["balance"].iloc[59])
+    same = mortgage_scenario(500_000, 0.04, 25, switch_year=5, start_rate=0.04)
+    assert float(same["payment"]) == pytest.approx(float(same["first_payment"]))
+
+
+def test_switch_after_term_is_paid_off():
+    s = mortgage_scenario(300_000, 0.05, 20, switch_year=20, start_rate=0.05)
+    assert float(s["payment"]) == 0 and float(s["balance"]) == pytest.approx(0, abs=1e-6)
+    assert balance_after(300_000, 0.05, 20, 240) == pytest.approx(0, abs=1e-6)
+
+
+def test_monthly_budget_drops_costs_that_end():
+    costs = [(1_500, 4), (6_000, None)]
+    assert monthly_budget(11_000, costs, 0) == 3_500
+    assert monthly_budget(11_000, costs, 5) == 5_000
+    assert monthly_budget(11_000, [(6_000, None)], 1, 0.10, 0.0) == pytest.approx(6_100)

@@ -10,6 +10,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import history
 import rates as boe
 from model import (INTEREST_ONLY, REPAYMENT, Scenario, ScenarioResult,
                    StochasticAssumptions, compare_scenarios, run_scenarios,
@@ -330,6 +331,158 @@ def custom_scenarios(a: StochasticAssumptions, cash: float, budget: float, premi
                        file_name="mortgage_scenarios.csv", mime="text/csv")
 
 
+# ------------------------------------------------------------------ variable vs fixed
+@st.cache_data(ttl=6 * 3600, show_spinner="Fetching rate history…")
+def load_history():
+    """Bank of England rate history, or None if unreachable."""
+    try:
+        return history.fetch_history()
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner="Replaying rate history…")
+def cached_test(d: pd.DataFrame, years: int, method: str, block: int, loan: float,
+                term: int) -> dict:
+    return history.run_test(d, years, method, block, 5_000, loan, term)
+
+
+def variable_vs_fixed() -> None:
+    st.caption(
+        "Is a variable mortgage cheaper than a series of 2-year fixes? This replays real "
+        "Bank of England rates. The settings above this section don't apply here. Every "
+        "option borrows the same amount over the same months, and savings are in interest "
+        "paid, compared with rolling 2-year fixes.")
+    d = load_history()
+    if d is None:
+        st.warning("Couldn't reach the Bank of England database just now, so this test "
+                   "can't run. Try again later.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    loan = c1.number_input("Loan (£)", 50_000, 2_000_000, 300_000, 10_000, key="hist_loan")
+    term = c2.slider("Mortgage term (yrs)", 10, 40, 25, 1, key="hist_term")
+    choices = [y for y in (5, 10, 15, 20, 25) if y <= term]
+    years = c3.selectbox("Compare over", choices, index=choices.index(min(10, term)),
+                         format_func=lambda y: f"{y} years", key="hist_years")
+    method = c4.radio(
+        "History", ("Continuous", "2-year segments", "5-year segments"), key="hist_method",
+        help="Continuous uses every possible start month in real order. Segments stitch "
+             "random pieces of history together, 5,000 times.")
+    kw = {"Continuous": ("continuous", 24), "2-year segments": ("segments", 24),
+          "5-year segments": ("segments", 60)}[method]
+
+    result = cached_test(d, years, kw[0], kw[1], loan, term)
+    table = history.summary(result)
+    span = f"{d.index[0]:%b %Y} to {d.index[-1]:%b %Y}"
+
+    st.subheader(f"How often was variable cheaper than rolling 2-year fixes, "
+                 f"over {years} years?")
+    cols = st.columns(len(table))
+    for col, (_, row) in zip(cols, table.iterrows()):
+        col.metric(row["Variable type"], f"{row['Variable cheaper (%)']:.0f}% of the time",
+                   f"Median {gbp(row['Median saving'])} saved"
+                   if row["Median saving"] >= 0 else f"Median {gbp(-row['Median saving'])} extra",
+                   delta_color="off")
+    if kw[0] == "continuous":
+        windows = len(result["starts"])
+        separate = len(d) // (years * 12)
+        st.caption(f"{windows} start months from {span}. They overlap heavily: the data "
+                   f"only holds {separate} fully separate {years}-year "
+                   f"period{'s' if separate != 1 else ''}, so these percentages can look "
+                   "more certain than they are.")
+    else:
+        st.caption(f"5,000 stitched histories drawn from {span}. Each repeats the same "
+                   "history in a different order, so it can't show a different rate "
+                   "environment.")
+
+    st.subheader("Spread of savings")
+    fig = go.Figure()
+    for i, key in enumerate(history.VARIABLE_TYPES):
+        fig.add_trace(go.Box(x=result["savings"][key], name=history.NAMES[key],
+                             marker=dict(color=SERIES_COLOURS[i]), boxmean=True,
+                             boxpoints=False, orientation="h"))
+    fig.add_vline(x=0, line_color="#999999", line_dash="dot")
+    fig.update_layout(height=300, xaxis_title="Interest saved compared with fixes (£)",
+                      showlegend=False,
+                      **{k: v for k, v in CHART_LAYOUT.items() if k not in ("hovermode", "legend")})
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("Right of the dotted line, variable was cheaper. Box = middle 50% of "
+               "outcomes. Line inside = median. Dashed line = mean.")
+
+    if kw[0] == "continuous":
+        st.subheader("Does the start date matter?")
+        fig = go.Figure()
+        for i, key in enumerate(history.VARIABLE_TYPES):
+            fig.add_trace(go.Scatter(
+                x=result["starts"], y=result["savings"][key], name=history.NAMES[key],
+                mode="lines", line=dict(color=SERIES_COLOURS[i], width=2),
+                hovertemplate=f"{history.NAMES[key]}: £%{{y:,.0f}}<extra></extra>"))
+        fig.add_hline(y=0, line_color="#999999", line_dash="dot")
+        fig.update_layout(height=340, xaxis_title="Month the mortgage started",
+                          yaxis_title="Interest saved (£)", **CHART_LAYOUT)
+        st.plotly_chart(fig, use_container_width=True)
+
+    deals = history.single_deals(d)
+    st.subheader("What drove the difference on single 2-year deals?")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Variable cheaper", f"{100 * (deals['gap'] > 0).mean():.0f}% of deals")
+    m2.metric("Average rate advantage", f"{deals['gap'].mean():+.2f}pp",
+              help="Average rate on rolling 2-year fixes minus the variable deal.")
+    m3.metric("Lower starting rate", f"{deals['premium'].mean():+.2f}pp",
+              help="How much lower the variable deal's rate was on day one.")
+    m4.metric("Without falling rates", f"{deals['gap_no_drift'].mean():+.2f}pp",
+              help="The advantage after removing Bank Rate's overall fall across the data. "
+                   f"Variable would win {100 * (deals['gap_no_drift'] > 0).mean():.0f}% of deals.")
+
+    st.subheader("The rates behind this test")
+    fig = go.Figure()
+    for key, colour, dash in (("fix2", SERIES_COLOURS[3], None), ("var2", SERIES_COLOURS[0], None),
+                              ("life", SERIES_COLOURS[1], None), ("svr", SERIES_COLOURS[2], None),
+                              ("bank", "#777777", "dot")):
+        name = history.NAMES.get(key, "Bank Rate")
+        fig.add_trace(go.Scatter(
+            x=d.index, y=d[key] * 100, name=name, mode="lines", connectgaps=False,
+            line=dict(color=colour, width=2, dash=dash),
+            hovertemplate=f"{name}: %{{y:.2f}}%<extra></extra>"))
+    fig.update_layout(height=340, yaxis_title="Rate (%)", **CHART_LAYOUT)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("All results")
+    rows = [history.summary(cached_test(d, y, kw[0], kw[1], loan, term)).assign(Years=y)
+            for y in choices]
+    show = pd.concat(rows).drop(columns="key")
+    csv = show.to_csv(index=False).encode()
+    show = show[["Years"] + [c for c in show.columns if c != "Years"]]
+    for c in ("Median saving", "10th %ile", "90th %ile", "Biggest 12-month rise",
+              "Fix: biggest 12-month rise"):
+        show[c] = show[c].map(gbp)
+    show["Variable cheaper (%)"] = show["Variable cheaper (%)"].map("{:.0f}".format)
+    show["Rate gap (pp)"] = show["Rate gap (pp)"].map("{:+.2f}".format)
+    st.dataframe(show, use_container_width=True, hide_index=True)
+    st.download_button("⬇️ Download results (CSV)", csv,
+                       file_name="variable_vs_fixed.csv", mime="text/csv")
+
+    with st.expander("ℹ️ How to read this test"):
+        st.markdown(
+            f"""
+- **Data:** Bank of England average quoted rates at 75% LTV, {span}. Variable deal data doesn't
+  go back further, so a 30- or 40-year test isn't possible.
+- **Rolling 2-year variable:** the margin over Bank Rate is locked for 2 years, then re-quoted.
+  This is a stand-in: some older deals in this series may have been discounts off the lender's
+  standard rate rather than true trackers.
+- **Lifetime tracker:** the margin is locked for the whole period. Margins have varied a lot over
+  time, so older start dates may reflect deals that aren't on offer today.
+- **Biggest 12-month rise:** the largest increase in the monthly payment compared with a year
+  earlier, as the median across paths. With segments this is overstated, because rates can
+  leap where two pieces of history join. Use Continuous to judge payment shocks.
+- **Not included:** product fees, early repayment charges and credit differences between borrowers.
+- **Past rates don't predict future rates,** and most of this period had falling rates.
+  **Not financial advice.**
+            """
+        )
+
+
 # ------------------------------------------------------------------ the tab
 @st.fragment
 def render_lab(a: StochasticAssumptions, fixed_years: int, term: int, real: bool,
@@ -356,12 +509,15 @@ def render_lab(a: StochasticAssumptions, fixed_years: int, term: int, real: bool
                            format_func=lambda h: f"{h} years")
     n_sims = c5.select_slider("Simulations", [200, 500, 1000, 2000, 5000], 1000)
 
-    tab_sweep, tab_custom = st.tabs(["🎯 Best deposit", "⚖️ Compare scenarios"])
+    tab_sweep, tab_custom, tab_history = st.tabs(
+        ["🎯 Best deposit", "⚖️ Compare scenarios", "📜 Variable vs fixed"])
     with tab_sweep:
         deposit_sweep(a, cash, budget, premium, n_sims, horizon, fixed_years, term, real,
                       live_df, use_live)
     with tab_custom:
         custom_scenarios(a, cash, budget, premium, n_sims, horizon, real, live_df, use_live)
+    with tab_history:
+        variable_vs_fixed()
 
     with st.expander("ℹ️ How the Mortgage lab works"):
         st.markdown(

@@ -12,7 +12,9 @@ family member, so the deployed app must stay simple to use.
 |---|---|
 | `model.py` | Pure-Python engine, no Streamlit imports. Deterministic + Monte Carlo. |
 | `app.py` | Streamlit UI: sidebar inputs, Plotly charts, CSV export. |
+| `afford.py` | Streamlit UI for the Affordability tab (payment matrix by loan, rate and term). |
 | `lab.py` | Streamlit UI for the Mortgage lab tab (deposit sweep, custom scenarios). |
+| `history.py` | Historical variable vs fixed test (no Streamlit). `analysis/variable_vs_fixed.py` prints it. |
 | `rates.py` | Live UK mortgage rates from the Bank of England database (no Streamlit). |
 | `test_model.py` | Pytest sanity tests. Run `python -m pytest -q` in the env before committing. |
 | `.streamlit/config.toml` | Light theme. Theming lives here, **not** in CSS. |
@@ -64,7 +66,22 @@ python -m pytest -q
 - Outputs: win-probability cards, filled 10th–90th percentile bands with
   median lines, box plots per horizon, percentile + win-rate tables.
 
-## Mortgage lab (second tab)
+## Affordability (second tab)
+- Replicates the owner's Excel: monthly payment matrix with mortgage sizes as rows
+  and rates as columns, one matrix per term (default 20/25/30), plus cash needed,
+  LTV and share of savings per row. Cash needed = deposit + SDLT + legal fees.
+- Budget = take-home income minus listed costs; costs can stop after N years
+  (e.g. childcare). Cells: ✓ fits, ! within 10%, ✗ over; greyed rows need more
+  cash than savings.
+- "In N years": pays a starting rate for N years, then remortgages at the column
+  rate (`mortgage_scenario`, closed form). Same rate means the same payment.
+  Budget projects pay rises and cost growth.
+- Detail view: headline cards per term (payment, total interest, total repaid,
+  mortgage-free year), payment over time against the budget, balance left and
+  interest vs principal by year.
+- Engine: `mortgage_scenario`, `repayment_schedule`, `monthly_budget` in `model.py`.
+
+## Mortgage lab (third tab)
 - Engine: `Scenario`, `simulate_scenario`, `run_scenarios`, `compare_scenarios` in
   `model.py`. NumPy-vectorised across sims, about 10 ms per 1,000 paths per
   scenario, so the tab recalculates on every edit with no run button.
@@ -83,6 +100,18 @@ python -m pytest -q
 - Scenarios last for the browser session; there's no save or load yet.
 - Volatility sliders are always in the sidebar because both tabs use them.
 - Lab colours are the dataviz skill's reference categorical palette, in order.
+
+## Variable vs fixed (third section of the Mortgage lab)
+- Tests whether variable beats rolling 2-year fixes, replaying BoE quoted rates at
+  75% LTV, excl. fees. Variable deal data starts Apr 1998 (zeros in the variable
+  and lifetime series are placeholders), so 30-40 years isn't possible.
+- Variable types: rolling 2-yr variable (`IUMBV48`, margin over Bank Rate locked
+  24 months, then re-quoted; a proxy, as some older deals may be discounts off
+  SVR), lifetime tracker (`IUMBV24`, margin locked throughout) and SVR (`IUMTLMV`).
+- Methods: continuous (every start month) or segments (block bootstrap, 2- or
+  5-year pieces). Continuous windows overlap heavily, so few are independent.
+  Segment payment rises are overstated because rates leap where pieces join.
+- Results are read from data at run time, so don't hardcode conclusions in the UI.
 
 ## UI decisions the owner has made (don't undo without asking)
 - Light theme via `config.toml`. Heavy `!important` CSS overrides broke table
@@ -112,6 +141,9 @@ Intended for Streamlit Community Cloud from this repo (`app.py`, branch
 settings.
 
 ## Changelog
+- **2026-11-10** — Affordability tab: payment matrix by mortgage size, rate and
+  term, budget check, future-year view and repayment over time.
+- **2026-11-01** — Variable vs fixed historical test added to the Mortgage lab.
 - **2026-10-30** — Mortgage lab tab: best-deposit sweep, repayment vs
   interest-only, and custom scenarios plotted against each other.
 - **2026-10-24** — Live BoE mortgage rates (sidebar toggle + fixed-period

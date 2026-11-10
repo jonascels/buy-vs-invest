@@ -756,3 +756,86 @@ def compare_scenarios(results: List[ScenarioResult], horizon: int,
             "Ran out of cash (%)": 100 * np.mean((r.funding_gap[:, :horizon] > 1).any(axis=1)),
         })
     return pd.DataFrame(rows)
+
+
+# ========================================================================== #
+# Affordability: payment matrices and repayment over time
+# ========================================================================== #
+#
+# A repayment mortgage at `start_rate` until `switch_year`, then remortgaged at
+# `rate` for the rest of the term. With switch_year = 0 the whole loan runs at
+# `rate`. Closed-form, so a full matrix is instant.
+
+def balance_after(principal, annual_rate, term_years: int, months):
+    """Balance left after `months` payments on a level repayment mortgage."""
+    r = np.asarray(annual_rate, dtype=float) / 12
+    n = term_years * 12
+    k = np.minimum(months, n)
+    growth = (1 + r) ** k
+    pmt = principal * r * (1 + r) ** n / ((1 + r) ** n - 1)
+    return np.maximum(principal * growth - pmt * (growth - 1) / r, 0.0)
+
+
+def mortgage_scenario(principal, rate, term_years: int, switch_year: int = 0,
+                      start_rate=None) -> dict:
+    """Payment now and after the switch, balance at the switch, and totals.
+
+    Works element-wise on arrays, so a whole matrix can be computed at once.
+    """
+    principal = np.asarray(principal, dtype=float)
+    rate = np.asarray(rate, dtype=float)
+    start = rate if start_rate is None or switch_year == 0 else np.asarray(start_rate, float)
+    n = term_years * 12
+    k = min(switch_year * 12, n)
+    r0 = start / 12
+    first = principal * r0 * (1 + r0) ** n / ((1 + r0) ** n - 1)
+    bal = balance_after(principal, start, term_years, k)
+    interest_before = first * k - (principal - bal)
+    if k >= n:
+        later = np.zeros_like(principal * rate)
+        interest_after = np.zeros_like(later)
+    else:
+        r1 = rate / 12
+        later = bal * r1 * (1 + r1) ** (n - k) / ((1 + r1) ** (n - k) - 1)
+        interest_after = later * (n - k) - bal
+    total_interest = interest_before + interest_after
+    return {"first_payment": first * np.ones_like(later), "payment": later,
+            "balance": bal * np.ones_like(later), "total_interest": total_interest,
+            "total_repaid": principal + total_interest}
+
+
+def repayment_schedule(principal: float, rate: float, term_years: int,
+                       switch_year: int = 0, start_rate: float | None = None
+                       ) -> pd.DataFrame:
+    """Month-by-month payment, interest, principal and balance."""
+    n = term_years * 12
+    k = switch_year * 12 if start_rate is not None else 0
+    balance = principal
+    pmt = monthly_mortgage_payment(principal, start_rate if k else rate, term_years)
+    rows = []
+    for m in range(n):
+        r = (start_rate if m < k else rate) / 12
+        if m == k and k:
+            left = n - m
+            pmt = balance * r * (1 + r) ** left / ((1 + r) ** left - 1)
+        interest = balance * r
+        principal_paid = min(pmt - interest, balance)
+        balance -= principal_paid
+        rows.append((m + 1, (m + 1) / 12, interest + principal_paid, interest,
+                     principal_paid, max(balance, 0.0)))
+    return pd.DataFrame(rows, columns=["month", "year", "payment", "interest",
+                                       "principal", "balance"])
+
+
+def monthly_budget(income: float, costs: List[Tuple[float, float | None]],
+                   years: float, income_growth: float = 0.0,
+                   cost_growth: float = 0.0) -> float:
+    """Money left for the mortgage each month, `years` from now.
+
+    costs: (monthly amount today, years until it stops or None for never).
+    """
+    left = income * (1 + income_growth) ** years
+    for amount, ends in costs:
+        if ends is None or years < ends:
+            left -= amount * (1 + cost_growth) ** years
+    return left

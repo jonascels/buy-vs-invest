@@ -59,9 +59,13 @@ def fetch_boe_rates(start: str = "01/Jan/2010", timeout: float = 15.0
 
     Raises on network / parse errors; callers decide how to fall back.
     """
-    codes = ",".join(s.code for s in SERIES)
+    return fetch_series([s.code for s in SERIES], start, timeout)
+
+
+def fetch_series(codes: list[str], start: str, timeout: float = 15.0) -> pd.DataFrame:
+    """Any monthly BoE series (in %), indexed by month-end date."""
     req = urllib.request.Request(
-        BOE_URL.format(start=start, codes=codes),
+        BOE_URL.format(start=start, codes=",".join(codes)),
         headers={"User-Agent": "Mozilla/5.0 (buy-vs-invest model)"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:

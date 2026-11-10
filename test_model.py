@@ -365,3 +365,74 @@ def test_rent_steps_cost_the_renter():
     np.random.seed(1)
     mc = run_model_stochastic(StochasticAssumptions(rent_steps=[(3, 800)], **NO_VOL))
     assert mc["rent"].iloc[36] > mc["rent"].iloc[35] + 700
+
+
+# ---- savings beyond the purchase -------------------------------------------
+
+def test_spare_savings_lift_both_paths_equally():
+    base = run_model(Assumptions())
+    upfront = base.attrs["upfront_purchase_costs"]
+    rich = run_model(Assumptions(savings=upfront + 100_000))
+    assert rich.attrs["spare_savings"] == pytest.approx(100_000)
+    gap = lambda df: df["buy_net_worth"] - df["invest_net_worth"]
+    assert np.allclose(gap(rich), gap(base))
+    assert np.allclose(rich["buy_home_net_worth"], base["buy_net_worth"])
+    g = (1 + 0.07 - 0.0016) ** (1 / 12)
+    pot = 100_000 * g ** 360
+    assert rich["savings_pot"].iloc[-1] == pytest.approx(pot - (pot - 100_000) * 0.2)
+    assert rich["buy_net_worth"].iloc[-1] > base["buy_net_worth"].iloc[-1] + 100_000
+
+
+def test_savings_short_of_upfront_is_flagged():
+    df = run_model(Assumptions(savings=100_000))
+    assert df.attrs["spare_savings"] == 0
+    assert df.attrs["savings_short"] == pytest.approx(df.attrs["upfront_purchase_costs"] - 100_000)
+    np.random.seed(0)
+    mc = run_model_stochastic(StochasticAssumptions(savings=500_000, **NO_VOL))
+    assert (mc["savings_pot"] > 0).all()
+
+
+def test_old_settings_files_move_savings_to_sidebar():
+    import settings
+    state = {}
+    settings.apply({"app": "buy-vs-invest", "widgets": {"fin_savings": 350_000}}, state)
+    assert state["sb_savings"] == 350_000 and "fin_savings" not in state
+
+
+# ---- overpayments -------------------------------------------------------------
+
+from model import overpayment_plan  # noqa: E402
+
+
+def test_overpayment_plan_places_lumps():
+    plan = overpayment_plan(36, 100, [(1, 5_000), (2.5, 2_000), (10, 1)])
+    assert plan[0] == 100 and plan[11] == 5_100 and plan[29] == 2_100
+    assert plan.sum() == pytest.approx(36 * 100 + 7_000)
+
+
+def test_overpayments_clear_mortgage_sooner_and_save_interest():
+    base = run_model(Assumptions())
+    over = run_model(Assumptions(overpay_monthly=500, overpay_lumps=[(5, 50_000)]))
+    paid_off = lambda df: int((df["loan_balance"] > 0).sum())
+    assert paid_off(over) < paid_off(base)
+    assert over["mortgage_interest"].sum() < base["mortgage_interest"].sum()
+    # Contractual payment unchanged while the loan is live; extra shows separately
+    assert over["mortgage_payment"].iloc[0] == pytest.approx(base["mortgage_payment"].iloc[0])
+    assert over["overpayment"].iloc[59] == pytest.approx(50_500)
+    # The renter invests the extra the buyer spends, so the comparison stays fair
+    assert over["renter_contribution"].iloc[0] > base["renter_contribution"].iloc[0]
+    # Loan cleared: everything repaid beyond interest equals the loan
+    total = over["mortgage_payment"].sum() + over["overpayment"].sum() \
+        - over["mortgage_interest"].sum()
+    assert total == pytest.approx(over.attrs["loan"], rel=1e-9)
+
+
+def test_overpayments_in_monte_carlo_and_schedule():
+    np.random.seed(0)
+    mc = run_model_stochastic(StochasticAssumptions(overpay_monthly=1_000, **NO_VOL))
+    base = run_model_stochastic(StochasticAssumptions(**NO_VOL))
+    assert (mc["loan_balance"] > 0).sum() < (base["loan_balance"] > 0).sum()
+    s = repayment_schedule(400_000, 0.05, 25, overpay_monthly=500, overpay_lumps=[(3, 20_000)])
+    assert s["balance"].iloc[-1] == pytest.approx(0, abs=1e-6)
+    assert (s["payment"] + s["overpayment"] - s["interest"]).sum() == pytest.approx(400_000)
+    assert (s["balance"] > 0).sum() < 300

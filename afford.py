@@ -108,7 +108,7 @@ def matrix(amounts: np.ndarray, rate_grid: np.ndarray, term: int, year: int,
     return text.style.apply(lambda _: colours, axis=None), short.any()
 
 
-def finances_panel(inflation: float) -> Finances:
+def finances_panel(inflation: float, savings: float) -> Finances:
     """Income, costs and savings shared by every section of the Mortgage tab."""
     left, right = st.columns([3, 2])
     with left:
@@ -134,8 +134,7 @@ def finances_panel(inflation: float) -> Finances:
         st.caption("List everything except the mortgage: bills, food, childcare, council "
                    "tax, upkeep. Add rows for costs you can see coming.")
     with right:
-        savings = st.number_input("Savings for deposit, stamp duty and fees (£)", 0,
-                                  20_000_000, 400_000, 10_000, key="fin_savings")
+        st.metric("Savings", gbp(savings), help="Set in the sidebar under Property.")
         g1, g2 = st.columns(2)
         income_growth = g1.number_input("Pay rises (%/yr)", 0.0, 10.0, 2.5, 0.25,
                                         key="fin_income_growth") / 100
@@ -231,26 +230,46 @@ def affordability_section(fin: Finances, price: float, sdlt: float, legal: float
                           key="aff_detail_amount")
     rate = d2.number_input("Interest rate (%)", 0.5, 12.0,
                            round(default_rate * 100, 2), 0.05, key="aff_detail_rate") / 100
+    o1, o2, o3 = st.columns(3)
+    overpay = o1.number_input("Overpay each month (£)", 0, 50_000, 0, 50, key="aff_overpay",
+                              help="Extra on top of the monthly payment. It clears the "
+                                   "mortgage sooner and cuts the interest.")
+    lump = o2.number_input("One-off lump sum (£)", 0, 5_000_000, 0, 1_000, key="aff_lump")
+    lump_year = o3.number_input("Paid at the end of year", 1, 40, 5, 1, key="aff_lump_year")
+    lumps = [(lump_year, lump)] if lump else []
+    overpaying = overpay > 0 or lump > 0
     if year:
         st.caption(f"Pays {start_rate * 100:.2f}% for {year} years, then {rate * 100:.2f}%.")
+    if overpaying:
+        st.caption("Most fixed-rate deals let you overpay up to 10% of the balance each year "
+                   "without an early repayment charge. Check your lender's limit.")
 
     cols = st.columns(len(terms))
     schedules = {}
     this_year = date.today().year
     for col, term in zip(cols, terms):
-        sched = repayment_schedule(amount, rate, term, year if year < term else 0,
-                                   start_rate if year and year < term else None)
+        switch = (year, start_rate) if year and year < term else (0, None)
+        sched = repayment_schedule(amount, rate, term, *switch, overpay, lumps)
+        plain = repayment_schedule(amount, rate, term, *switch) if overpaying else sched
         schedules[term] = sched
         first = sched["payment"].iloc[0]
         later = sched["payment"].iloc[year * 12] if year and year < term else first
+        months_live = int((sched["balance"] > 1e-6).sum()) + 1
+        free_in = min(months_live, term * 12) / 12
         col.markdown(f"**{term} years**")
-        col.metric("Monthly payment", gbp(first),
+        col.metric("Monthly payment", gbp(first + overpay),
                    f"{gbp(later - first)} from year {year}" if abs(later - first) >= 1 else None,
-                   delta_color="inverse", delta_arrow="off")
-        col.metric("Total interest", gbp(sched["interest"].sum()))
-        col.metric("Total repaid", gbp(sched["payment"].sum()))
-        col.caption(f"Mortgage-free in {this_year + term} · "
-                    f"{status(first, budget_now).replace('ok', 'fits today').replace('tight', 'tight today').replace('over', 'over budget today')}")
+                   delta_color="inverse", delta_arrow="off",
+                   help="Including your monthly overpayment." if overpay else None)
+        saved = plain["interest"].sum() - sched["interest"].sum()
+        col.metric("Total interest", gbp(sched["interest"].sum()),
+                   f"{gbp(saved)} less" if saved >= 1 else None,
+                   delta_color="normal", delta_arrow="off")
+        col.metric("Total repaid", gbp((sched["payment"] + sched["overpayment"]).sum()))
+        sooner = term - free_in
+        col.caption(f"Mortgage-free in {this_year + int(np.ceil(free_in))}"
+                    + (f" ({sooner:.1f} years sooner)" if sooner >= 0.1 else "") + " · "
+                    f"{status(first + overpay, budget_now).replace('ok', 'fits today').replace('tight', 'tight today').replace('over', 'over budget today')}")
 
     years_axis = np.arange(0, max(terms) * 12) / 12
     budget_line = [fin.budget(y) for y in years_axis]
@@ -260,7 +279,7 @@ def affordability_section(fin: Finances, price: float, sdlt: float, legal: float
     for i, term in enumerate(terms):
         s = schedules[term]
         fig.add_trace(go.Scatter(
-            x=s["year"], y=s["payment"], name=f"{term} years", mode="lines",
+            x=s["year"], y=s["payment"] + s["overpayment"], name=f"{term} years", mode="lines",
             line=dict(color=SERIES_COLOURS[i], width=2, shape="hv"),
             hovertemplate=f"{term} yrs: £%{{y:,.0f}}<extra></extra>"))
     fig.add_trace(go.Scatter(
@@ -292,6 +311,7 @@ def affordability_section(fin: Finances, price: float, sdlt: float, legal: float
                                  format_func=lambda t: f"{t}-year mortgage",
                                  key="aff_split_term")
         s = schedules[term_pick]
+        s = s.assign(principal=s["principal"] + s["overpayment"])
         yearly = s.groupby(np.ceil(s["year"]).astype(int))[["interest", "principal"]].sum()
         fig = go.Figure()
         fig.add_trace(go.Bar(x=yearly.index, y=yearly["interest"], name="Interest",
@@ -315,7 +335,10 @@ def affordability_section(fin: Finances, price: float, sdlt: float, legal: float
   matter when you look ahead. Costs join in their start year and drop out after their
   stop year.
 - **Cash needed:** deposit (price minus mortgage) + stamp duty + legal fees.
-- **Not included:** product fees, lender affordability rules (often 4 to 5 times income)
-  and overpayments. **Not financial advice.**
+- **Overpayments** (detail view only): paid on top of the monthly payment, they clear the
+  loan sooner. The matrix shows the normal payment. At a remortgage the new payment is
+  worked out on the smaller balance, so it drops.
+- **Not included:** product fees and lender affordability rules (often 4 to 5 times income).
+  **Not financial advice.**
             """
         )

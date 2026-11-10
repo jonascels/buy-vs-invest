@@ -48,6 +48,23 @@ python -m pytest -q
   app picks the band the user's LTV fits under (`best_series`), caches the
   fetch for 6h, and falls back to a manual slider if the BoE is unreachable.
   Deterministic mode applies the chosen rate for the whole term.
+- **Savings** (`Assumptions.savings`, sidebar "Savings and investments", key
+  `sb_savings`, shared with the Mortgage tab): savings left after the upfront
+  purchase cash are invested on both paths at the same return (`_add_savings_pot`,
+  net of CGT). `buy_net_worth` and `invest_net_worth` include the pot, so the gap
+  and winner are unchanged; `buy_home_net_worth` keeps the home-only figure, shown
+  as a third dotted curve ("Buy, home only"). Short savings show a warning.
+  Old settings files with `fin_savings` load into `sb_savings`.
+- **Overpayments** (`Assumptions.overpay_monthly`, `overpay_lumps` as (years, £);
+  sidebar "Overpayments"): `overpayment_plan` builds the monthly extra (a lump
+  "in year Y" lands at month Y*12). All schedules (`_amortisation_schedule`,
+  `_variable_rate_schedule`, `repayment_schedule`) take it off the balance after
+  the regular payment; the contractual payment is unchanged until payoff, except
+  at a remortgage, where it's recalculated on the smaller balance. Overpayments
+  count as buyer outgoings, so the renter invests the same extra (fair). The
+  tab shows years saved and interest saved, and warns above 10% of the loan in
+  year one. The Mortgage tab detail view has its own monthly and lump-sum
+  inputs; the matrix and the Compare mortgages engine don't model overpayments.
 - **Rent step-ups** (`Assumptions.rent_steps`, sidebar "Bigger home later?" table):
   (years from now, extra £/month at today's prices). Rent each month =
   `rent_today_prices(a, year)` x cumulative rent growth, so a step is indexed
@@ -162,7 +179,7 @@ rises and cost growth. Budget = income minus active costs (`monthly_budget`,
   with NumPy would make 1,000+ sims near-instant.
 - No correlation between asset shocks (e.g. rates vs house prices).
 - Lender rules (max LTV for interest-only, affordability) aren't enforced.
-- No remortgage fees, overpayments, ISA/pension tax wrappers, or rental income.
+- No remortgage fees, ISA/pension tax wrappers, or rental income.
 - MC grows assets with simple `rate/12` monthly steps while deterministic
   compounds, so zero-vol MC net worth sits slightly below deterministic.
 - `use_container_width` is deprecated in current Streamlit (log warnings).
@@ -175,6 +192,10 @@ Intended for Streamlit Community Cloud from this repo (`app.py`, branch
 settings.
 
 ## Changelog
+- **2026-11-10** — Mortgage overpayments (monthly and lump sums) in Buy vs invest
+  and the Mortgage tab detail view.
+- **2026-11-10** — Savings beyond the purchase invested on both paths; third
+  "home only" curve; savings input moved to the sidebar for both tabs.
 - **2026-11-10** — Rent vs mortgage trend chart; rent step-ups for a bigger home.
 - **2026-11-10** — Save and load settings as a file.
 - **2026-11-10** — Affordability and Mortgage lab merged into one Mortgage tab with

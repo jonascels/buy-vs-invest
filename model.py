@@ -98,10 +98,19 @@ class Assumptions:
     # prices). The extra grows with rent like the rest of it.
     rent_steps: List[Tuple[float, float]] = field(default_factory=list)
 
+    # Mortgage overpayments: a regular monthly amount, plus one-off lump sums as
+    # (years from now, £). They shorten the mortgage; the contractual payment
+    # stays the same until the loan is cleared.
+    overpay_monthly: float = 0.0
+    overpay_lumps: List[Tuple[float, float]] = field(default_factory=list)
+
     # Investment alternative
     investment_return: float = 0.07      # annual nominal (e.g. global equities)
     investment_fee: float = 0.0016       # annual OCF drag (your ~0.16% blend)
     capital_gains_tax: float = 0.20      # CGT on gains when liquidated
+    # Total savings and investments. Whatever isn't needed upfront for the
+    # purchase is invested by both buyer and renter. None = just the upfront cash.
+    savings: float | None = None
 
     # Economy
     inflation: float = 0.025             # annual CPI, for "real" conversions
@@ -115,21 +124,64 @@ def rent_today_prices(a: Assumptions, year: float) -> float:
     return a.monthly_rent + sum(extra for when, extra in a.rent_steps if year >= when)
 
 
+def _add_savings_pot(df: pd.DataFrame, a: Assumptions, upfront: float,
+                     monthly_growth) -> None:
+    """Add the savings left after the purchase, invested on both paths.
+
+    `buy_home_net_worth` keeps the buyer's home-only figure; `buy_net_worth`
+    and `invest_net_worth` then include the pot, so both start from the same
+    wealth. The gap between them is unchanged.
+    """
+    spare = max((a.savings or 0.0) - upfront, 0.0)
+    pot = spare * np.cumprod(1 + np.broadcast_to(monthly_growth, len(df)))
+    df["savings_pot"] = pot - np.maximum(pot - spare, 0) * a.capital_gains_tax
+    df["buy_home_net_worth"] = df["buy_net_worth"]
+    df["buy_net_worth"] = df["buy_net_worth"] + df["savings_pot"]
+    df["invest_net_worth"] = df["invest_net_worth"] + df["savings_pot"]
+    df["buy_home_net_worth_real"] = df["buy_home_net_worth"] / df["inflation_index"]
+    df.attrs["spare_savings"] = spare
+    df.attrs["savings_short"] = max(upfront - a.savings, 0.0) if a.savings else 0.0
+
+
+def overpayment_plan(months: int, monthly: float = 0.0,
+                     lumps: List[Tuple[float, float]] | None = None) -> np.ndarray:
+    """Planned extra repayment for each month (index 0 = month 1).
+
+    A lump sum "in year Y" is paid at the end of year Y (month Y * 12).
+    """
+    plan = np.full(months, float(monthly))
+    for year, amount in lumps or []:
+        m = max(int(round(year * 12)), 1)
+        if m <= months:
+            plan[m - 1] += amount
+    return plan
+
+
 def _amortisation_schedule(principal: float, annual_rate: float,
-                           term_years: int, months: int) -> pd.DataFrame:
-    """Month-by-month balance, interest and principal for `months` months."""
+                           term_years: int, months: int,
+                           overpay: np.ndarray | None = None) -> pd.DataFrame:
+    """Month-by-month payment, interest, principal, overpayment and balance.
+
+    Overpayments come off the balance after the regular payment, capped at
+    what's left; once the loan is cleared everything is zero.
+    """
     pmt = monthly_mortgage_payment(principal, annual_rate, term_years)
     r = annual_rate / 12.0
+    extra = overpay if overpay is not None else np.zeros(months)
     rows = []
     balance = principal
     for m in range(1, months + 1):
+        if balance <= 1e-6:
+            rows.append((m, 0.0, 0.0, 0.0, 0.0, 0.0))
+            continue
         interest = balance * r
         principal_paid = min(pmt - interest, balance)
-        balance = max(balance - principal_paid, 0.0)
-        rows.append((m, pmt if balance > 0 or principal_paid > 0 else 0.0,
-                     interest, principal_paid, balance))
+        balance -= principal_paid
+        over = min(extra[m - 1], balance)
+        balance = max(balance - over, 0.0)
+        rows.append((m, interest + principal_paid, interest, principal_paid, over, balance))
     return pd.DataFrame(
-        rows, columns=["month", "payment", "interest", "principal", "balance"]
+        rows, columns=["month", "payment", "interest", "principal", "overpayment", "balance"]
     )
 
 
@@ -147,8 +199,9 @@ def run_model(a: Assumptions) -> pd.DataFrame:
     sdlt = stamp_duty(a.house_price, a.first_time_buyer, a.additional_property)
     upfront_purchase_costs = deposit + sdlt + a.legal_survey_fixed
 
-    sched = _amortisation_schedule(loan, a.mortgage_rate,
-                                   a.mortgage_term_years, months)
+    sched = _amortisation_schedule(
+        loan, a.mortgage_rate, a.mortgage_term_years, months,
+        overpayment_plan(months, a.overpay_monthly, a.overpay_lumps))
 
     # Monthly growth factors
     g_house = (1 + a.house_appreciation) ** (1 / 12) - 1
@@ -173,6 +226,7 @@ def run_model(a: Assumptions) -> pd.DataFrame:
         house_value *= (1 + g_house)
         row = sched.loc[m - 1]
         mortgage_pmt = row["payment"]
+        overpay = row["overpayment"]
         loan_balance = row["balance"]
         rent = rent_today_prices(a, (m - 1) / 12) * rent_index
 
@@ -181,7 +235,7 @@ def run_model(a: Assumptions) -> pd.DataFrame:
         ins = house_value * a.insurance_pct / 12
         svc = a.service_charge / 12
         ctax = a.council_tax / 12
-        buy_monthly_outgoing = mortgage_pmt + maint + ins + svc + ctax
+        buy_monthly_outgoing = mortgage_pmt + overpay + maint + ins + svc + ctax
 
         # renter's outgoing
         rent_monthly_outgoing = rent + ctax  # renters also pay council tax
@@ -205,6 +259,7 @@ def run_model(a: Assumptions) -> pd.DataFrame:
             "loan_balance": loan_balance,
             "home_equity": house_value - loan_balance,
             "mortgage_payment": mortgage_pmt,
+            "overpayment": overpay,
             "mortgage_interest": row["interest"],
             "maintenance": maint,
             "insurance": ins,
@@ -248,6 +303,7 @@ def run_model(a: Assumptions) -> pd.DataFrame:
     # INVEST net worth = portfolio minus CGT on gains
     gain = (df["portfolio_value"] - df["invested_basis"]).clip(lower=0)
     df["invest_net_worth"] = df["portfolio_value"] - gain * a.capital_gains_tax
+    _add_savings_pot(df, a, upfront_purchase_costs, g_inv)
 
     # real (today's money) versions
     df["buy_net_worth_real"] = df["buy_net_worth"] / df["inflation_index"]
@@ -329,15 +385,19 @@ def paid_rate_by_month(market_rates: np.ndarray, fixed_period_years: int
 
 
 def _variable_rate_schedule(principal: float, monthly_rates: np.ndarray,
-                            term_years: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Payments and end-of-month balances when the rate can change.
+                            term_years: int, overpay: np.ndarray | None = None
+                            ) -> Tuple[np.ndarray, np.ndarray]:
+    """Payments (including any overpayment) and end-of-month balances when the
+    rate can change.
 
     Whenever the rate changes the payment is recalculated so the remaining
-    balance still clears by the end of the original term. With a constant
-    rate this matches `_amortisation_schedule`.
+    balance still clears by the end of the original term (after overpayments
+    that means a lower payment, as when remortgaging). With a constant rate this
+    matches `_amortisation_schedule`.
     """
     months = len(monthly_rates)
     term_months = term_years * 12
+    extra = overpay if overpay is not None else np.zeros(months)
     payments = np.zeros(months)
     balances = np.zeros(months)
     balance = principal
@@ -345,7 +405,7 @@ def _variable_rate_schedule(principal: float, monthly_rates: np.ndarray,
     prev_rate = None
     for m in range(months):
         rate = monthly_rates[m]
-        if balance <= 0 or m >= term_months:
+        if balance <= 1e-6 or m >= term_months:
             balances[m] = max(balance, 0.0)
             continue
         if rate != prev_rate:
@@ -353,8 +413,10 @@ def _variable_rate_schedule(principal: float, monthly_rates: np.ndarray,
             prev_rate = rate
         interest = balance * rate / 12
         principal_paid = min(pmt - interest, balance)
-        payments[m] = interest + principal_paid
-        balance = max(balance - principal_paid, 0.0)
+        balance -= principal_paid
+        over = min(extra[m], balance)
+        balance = max(balance - over, 0.0)
+        payments[m] = interest + principal_paid + over
         balances[m] = balance
     return payments, balances
 
@@ -398,8 +460,9 @@ def run_model_stochastic(a: StochasticAssumptions, seed: int | None = None
     # Mortgage: market rate path, locked for each fixed period
     market_rates = market_rate_path(a, rate_shocks)
     paid_rates = paid_rate_by_month(market_rates, a.fixed_period_years)
-    payments, balances = _variable_rate_schedule(loan, paid_rates,
-                                                 a.mortgage_term_years)
+    payments, balances = _variable_rate_schedule(
+        loan, paid_rates, a.mortgage_term_years,
+        overpayment_plan(months, a.overpay_monthly, a.overpay_lumps))
 
     # Monthly inflation (constant, not stochastic)
     g_infl = (1 + a.inflation) ** (1 / 12) - 1
@@ -489,6 +552,7 @@ def run_model_stochastic(a: StochasticAssumptions, seed: int | None = None
     
     gain = (df["portfolio_value"] - df["invested_basis"]).clip(lower=0)
     df["invest_net_worth"] = df["portfolio_value"] - gain * a.capital_gains_tax
+    _add_savings_pot(df, a, upfront_purchase_costs, inv_monthly)
     
     df["buy_net_worth_real"] = df["buy_net_worth"] / df["inflation_index"]
     df["invest_net_worth_real"] = df["invest_net_worth"] / df["inflation_index"]
@@ -826,26 +890,38 @@ def mortgage_scenario(principal, rate, term_years: int, switch_year: int = 0,
 
 
 def repayment_schedule(principal: float, rate: float, term_years: int,
-                       switch_year: int = 0, start_rate: float | None = None
+                       switch_year: int = 0, start_rate: float | None = None,
+                       overpay_monthly: float = 0.0,
+                       overpay_lumps: List[Tuple[float, float]] | None = None
                        ) -> pd.DataFrame:
-    """Month-by-month payment, interest, principal and balance."""
+    """Month-by-month payment, interest, principal, overpayment and balance.
+
+    At a remortgage (switch_year) the payment is recalculated on the balance
+    left over the rest of the term, so overpayments lower it from then on.
+    """
     n = term_years * 12
     k = switch_year * 12 if start_rate is not None else 0
+    extra = overpayment_plan(n, overpay_monthly, overpay_lumps)
     balance = principal
     pmt = monthly_mortgage_payment(principal, start_rate if k else rate, term_years)
     rows = []
     for m in range(n):
         r = (start_rate if m < k else rate) / 12
+        if balance <= 1e-6:
+            rows.append((m + 1, (m + 1) / 12, 0.0, 0.0, 0.0, 0.0, 0.0))
+            continue
         if m == k and k:
             left = n - m
             pmt = balance * r * (1 + r) ** left / ((1 + r) ** left - 1)
         interest = balance * r
         principal_paid = min(pmt - interest, balance)
         balance -= principal_paid
+        over = min(extra[m], balance)
+        balance = max(balance - over, 0.0)
         rows.append((m + 1, (m + 1) / 12, interest + principal_paid, interest,
-                     principal_paid, max(balance, 0.0)))
+                     principal_paid, over, balance))
     return pd.DataFrame(rows, columns=["month", "year", "payment", "interest",
-                                       "principal", "balance"])
+                                       "principal", "overpayment", "balance"])
 
 
 Cost = Tuple[float, "float | None", "float | None"]

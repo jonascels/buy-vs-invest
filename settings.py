@@ -27,7 +27,7 @@ FORMAT_VERSION = 1
 # Inputs with a fixed key. Anything else in a loaded file is ignored.
 STATIC_KEYS = [
     # sidebar
-    "sb_mode", "sb_house_price", "sb_deposit", "sb_fixed_years", "sb_use_live", "sb_rate",
+    "sb_mode", "sb_house_price", "sb_savings", "sb_overpay", "sb_deposit", "sb_fixed_years", "sb_use_live", "sb_rate",
     "sb_term", "sb_appreciation", "sb_ftb", "sb_addl", "sb_maintenance", "sb_insurance",
     "sb_service", "sb_council_tax", "sb_legal", "sb_selling", "sb_rent", "sb_rent_growth",
     "sb_inv_return", "sb_inv_fee", "sb_cgt", "sb_inflation", "sb_real", "sb_n_sims",
@@ -35,14 +35,15 @@ STATIC_KEYS = [
     # buy vs invest tab
     "trend_horizon",
     # mortgage tab
-    "fin_income", "fin_savings", "fin_income_growth", "fin_cost_growth",
+    "fin_income", "fin_income_growth", "fin_cost_growth",
     "aff_step", "aff_terms", "aff_rates", "aff_rate_step", "aff_year", "aff_show",
     "aff_start_rate", "aff_detail_amount", "aff_detail_rate", "aff_split_term",
+    "aff_overpay", "aff_lump", "aff_lump_year",
     "cmp_horizon", "cmp_premium",
     "hist_loan", "hist_term", "hist_years", "hist_method",
 ]
 DYNAMIC_KEYS = ["sb_rate_vol", "sb_long_run", "aff_amounts"]
-TABLES = ["fin_costs", "cmp_scenarios", "rent_steps"]
+TABLES = ["fin_costs", "cmp_scenarios", "rent_steps", "overpay_lumps"]
 
 _SNAPSHOT = "_settings_snapshot"
 _LOADED = "_settings_loaded"      # dynamic values waiting for their widget
@@ -136,7 +137,10 @@ def apply(data: dict, state=None) -> int:
         raise ValueError("This file comes from a newer version of the app.")
     loaded = state[_LOADED] if _LOADED in state else {}
     count = 0
-    for key, value in data.get("widgets", {}).items():
+    widgets = dict(data.get("widgets", {}))
+    if "fin_savings" in widgets:  # savings moved from the Mortgage tab to the sidebar
+        widgets.setdefault("sb_savings", widgets.pop("fin_savings"))
+    for key, value in widgets.items():
         if isinstance(value, list) and key != "aff_terms":
             value = tuple(value)  # range sliders
         if key in STATIC_KEYS:

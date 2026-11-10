@@ -5,6 +5,7 @@ Run with:  streamlit run app.py
 """
 
 import time
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -19,6 +20,8 @@ from model import (Assumptions, StochasticAssumptions, monthly_mortgage_payment,
 
 st.set_page_config(page_title="Buy vs Invest", layout="wide")
 
+DEFAULT_LUMPS = pd.DataFrame({"In (yrs)": pd.Series(dtype="float"),
+                              "Amount (£)": pd.Series(dtype="float")})
 DEFAULT_RENT_STEPS = pd.DataFrame({"In (yrs)": pd.Series(dtype="float"),
                                    "Extra £/month": pd.Series(dtype="float")})
 
@@ -78,6 +81,10 @@ mode = sb.radio("Analysis mode", ("Deterministic", "Monte Carlo"), horizontal=Fa
 with sb.expander("Property", expanded=True):
     house_price = st.slider("House price (£)", 150_000, 2_500_000, 1_000_000, 10_000,
                             key="sb_house_price")
+    savings = st.number_input(
+        "Savings and investments (£)", 0, 50_000_000, 400_000, 10_000, key="sb_savings",
+        help="Everything you could put towards the purchase. Whatever isn't needed for "
+             "the deposit, stamp duty and fees is invested, whether you buy or rent.")
     deposit_pct = st.slider("Deposit (%)", 5, 100, 20, 1, key="sb_deposit",
                             help="Set to 100% for a cash purchase with no mortgage") / 100
     cash_purchase = deposit_pct >= 1.0
@@ -114,6 +121,27 @@ with sb.expander("Property", expanded=True):
                              key="sb_appreciation") / 100
     ftb = st.checkbox("First-time buyer (SDLT relief)", value=False, key="sb_ftb")
     addl = st.checkbox("Additional property (+5% SDLT)", value=False, key="sb_addl")
+
+with sb.expander("Overpayments"):
+    overpay_monthly = st.number_input(
+        "Overpay each month (£)", 0, 50_000, 0, 50, key="sb_overpay",
+        disabled=cash_purchase,
+        help="Extra on top of the mortgage payment. The renter invests the same "
+             "amount, so the comparison stays fair.")
+    st.caption("One-off lump sums, paid at the end of the year you enter.")
+    lump_rows, lump_key = settings.table("overpay_lumps", DEFAULT_LUMPS)
+    lumps_df = st.data_editor(
+        lump_rows, key=lump_key, num_rows="dynamic", hide_index=True, width="stretch",
+        disabled=cash_purchase,
+        column_config={
+            "In (yrs)": st.column_config.NumberColumn(min_value=1, max_value=40, step=1),
+            "Amount (£)": st.column_config.NumberColumn(min_value=0, step=1_000,
+                                                        format="£%.0f"),
+        })
+    settings.remember_table("overpay_lumps", lumps_df)
+    overpay_lumps = sorted((float(r["In (yrs)"]), float(r["Amount (£)"]))
+                           for _, r in lumps_df.iterrows()
+                           if pd.notna(r["In (yrs)"]) and pd.notna(r["Amount (£)"]))
 
 with sb.expander("Running & transaction costs"):
     maintenance = st.slider("Maintenance (%/yr of value)", 0.0, 3.0, 1.0, 0.1,
@@ -286,6 +314,7 @@ with tab_main:
             service_charge=service_charge, council_tax=council_tax,
             legal_survey_fixed=legal, selling_cost_pct=selling_cost,
             monthly_rent=rent, rent_growth=rent_growth, rent_steps=rent_steps,
+            savings=savings, overpay_monthly=overpay_monthly, overpay_lumps=overpay_lumps,
             investment_return=inv_return, investment_fee=inv_fee, capital_gains_tax=cgt,
             inflation=inflation,
         )
@@ -307,6 +336,26 @@ with tab_main:
         c2.metric("Stamp duty (SDLT)", gbp(df.attrs["sdlt"]))
         c3.metric("Loan", gbp(df.attrs["loan"]))
         c4.metric("Cash needed upfront", gbp(df.attrs["upfront_purchase_costs"]))
+        spare = df.attrs["spare_savings"]
+        if df.attrs["savings_short"] > 0:
+            st.warning(f"Your savings are {gbp(df.attrs['savings_short'])} short of the cash "
+                       "needed upfront. The model assumes you find the rest.")
+        elif spare > 0:
+            st.caption(f"You'd have {gbp(spare)} of savings left after buying. Both paths "
+                       "invest it, so both totals include it.")
+        if df.attrs["loan"] > 0 and (a.overpay_monthly > 0 or a.overpay_lumps):
+            plain = run_model(replace(a, overpay_monthly=0.0, overpay_lumps=[]))
+            live = lambda d: int((d["loan_balance"] > 1e-6).sum()) + 1
+            free_in = min(live(df), a.mortgage_term_years * 12) / 12
+            normal = min(live(plain), a.mortgage_term_years * 12) / 12
+            saved = plain["mortgage_interest"].sum() - df["mortgage_interest"].sum()
+            st.info(f"Overpaying clears the mortgage in {free_in:.1f} years instead of "
+                    f"{normal:.0f}, saving {gbp(saved)} in interest. The renter invests the "
+                    "same extra money each month, so the comparison stays fair.")
+            first_year = df["overpayment"].iloc[:12].sum()
+            if first_year > 0.1 * df.attrs["loan"]:
+                st.caption("That's more than 10% of the loan in the first year. Most "
+                           "fixed-rate deals charge for overpaying beyond 10% a year.")
     
         st.divider()
     
@@ -331,14 +380,22 @@ with tab_main:
         # ---- main chart
         st.subheader(f"Net worth over time{suffix}")
         fig = go.Figure()
+        buy_name = "Buy, and invest the rest" if spare > 0 else "Buy"
+        inv_name = "Invest everything" if spare > 0 else "Invest"
         fig.add_trace(go.Scatter(
-            x=df["year"], y=df[buy_col], name="Buy", mode="lines",
+            x=df["year"], y=df[buy_col], name=buy_name, mode="lines",
             line=dict(color="#1e88e5", width=3),
-            hovertemplate="Yr %{x:.1f}<br>Buy £%{y:,.0f}<extra></extra>"))
+            hovertemplate=f"{buy_name} £%{{y:,.0f}}<extra></extra>"))
         fig.add_trace(go.Scatter(
-            x=df["year"], y=df[inv_col], name="Invest", mode="lines",
+            x=df["year"], y=df[inv_col], name=inv_name, mode="lines",
             line=dict(color="#f57c00", width=3),
-            hovertemplate="Yr %{x:.1f}<br>Invest £%{y:,.0f}<extra></extra>"))
+            hovertemplate=f"{inv_name} £%{{y:,.0f}}<extra></extra>"))
+        if spare > 0:
+            home_col = "buy_home_net_worth_real" if real_terms else "buy_home_net_worth"
+            fig.add_trace(go.Scatter(
+                x=df["year"], y=df[home_col], name="Buy, home only", mode="lines",
+                line=dict(color="#1e88e5", width=2, dash="dot"),
+                hovertemplate="Home only £%{y:,.0f}<extra></extra>"))
         for h in a.horizons:
             fig.add_vline(x=h, line_dash="dot", line_color="#999999", opacity=0.5)
         fig.update_layout(
@@ -349,7 +406,12 @@ with tab_main:
             font=dict(size=12, color="#333333"),
             paper_bgcolor="white", plot_bgcolor="#fafafa")
         st.plotly_chart(fig, use_container_width=True)
-    
+        if spare > 0:
+            st.caption("Buy, and invest the rest = your home equity plus the savings you didn't "
+                       "need, invested at the same return as the renter's. Invest everything = "
+                       "all your savings invested, plus any monthly difference. Buy, home only "
+                       "leaves the spare savings out, so it isn't a like-for-like comparison.")
+
         # ---- rent vs mortgage
         st.subheader(f"Rent vs mortgage over time{suffix}")
         deflate = 1 / df["inflation_index"] if real_terms else 1.0
@@ -360,11 +422,12 @@ with tab_main:
             line=dict(color="#f57c00", width=3, shape="hv"),
             hovertemplate="Rent £%{y:,.0f}<extra></extra>"))
         f3.add_trace(go.Scatter(
-            x=df["year"], y=df["mortgage_payment"] * deflate, name="Mortgage repayment",
+            x=df["year"], y=(df["mortgage_payment"] + df["overpayment"]) * deflate,
+            name="Mortgage repayment",
             mode="lines", line=dict(color="#1e88e5", width=3),
             hovertemplate="Mortgage £%{y:,.0f}<extra></extra>"))
         f3.add_trace(go.Scatter(
-            x=df["year"], y=(df["mortgage_payment"] + upkeep) * deflate,
+            x=df["year"], y=(df["mortgage_payment"] + df["overpayment"] + upkeep) * deflate,
             name="Mortgage + upkeep and insurance", mode="lines",
             line=dict(color="#1e88e5", width=2, dash="dot"),
             hovertemplate="Mortgage + upkeep £%{y:,.0f}<extra></extra>"))
@@ -391,7 +454,7 @@ with tab_main:
         window = df[df["year"] <= h]
         w_deflate = deflate[: len(window)] if real_terms else 1.0
         rent_total = (window["rent"] * w_deflate).sum()
-        mortgage_total = (window["mortgage_payment"] * w_deflate).sum()
+        mortgage_total = ((window["mortgage_payment"] + window["overpayment"]) * w_deflate).sum()
         sunk_owning = ((window["mortgage_interest"] + upkeep[: len(window)]) * w_deflate).sum() \
             + df.attrs["sdlt"] + legal
         t1, t2, t3 = st.columns(3)
@@ -467,7 +530,8 @@ with tab_main:
             maintenance_pct=maintenance, insurance_pct=insurance,
             service_charge=service_charge, council_tax=council_tax,
             legal_survey_fixed=legal, selling_cost_pct=selling_cost,
-            monthly_rent=rent, rent_growth=rent_growth, rent_steps=rent_steps, rent_growth_std=rent_vol,
+            monthly_rent=rent, rent_growth=rent_growth, rent_steps=rent_steps,
+            savings=savings, overpay_monthly=overpay_monthly, overpay_lumps=overpay_lumps, rent_growth_std=rent_vol,
             investment_return=inv_return, investment_fee=inv_fee,
             investment_return_std=inv_vol,
             mortgage_rate_std=rate_vol, fixed_period_years=fixed_years,
@@ -710,7 +774,7 @@ with tab_mortgage:
             investment_return_std=inv_vol,
             mortgage_rate_std=rate_vol, fixed_period_years=fixed_years,
             mortgage_rate_long_run=long_run_rate,
-            capital_gains_tax=cgt, inflation=inflation,
+            capital_gains_tax=cgt, inflation=inflation, savings=savings,
         ),
         ftb, addl, legal, fixed_years, term, real_terms, live_df, use_live,
     )

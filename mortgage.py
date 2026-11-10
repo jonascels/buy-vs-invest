@@ -409,7 +409,7 @@ def render_mortgage_tab(a: StochasticAssumptions, ftb: bool, addl: bool, legal: 
                         use_live: bool) -> None:
     """A fragment, so edits here don't re-run the Buy vs invest tab."""
     st.subheader("Your finances")
-    fin = finances_panel(a.inflation)
+    fin = finances_panel(a.inflation, a.savings or 0.0)
 
     afford_tab, compare_tab, history_tab = st.tabs(
         ["What can we afford?", "Compare mortgages", "Variable or fixed?"])

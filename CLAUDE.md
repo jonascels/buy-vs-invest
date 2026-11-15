@@ -135,9 +135,12 @@ rises and cost growth. Budget = income minus active costs (`monthly_budget`,
 - Tests whether variable beats rolling 2-year fixes, replaying BoE quoted rates at
   75% LTV, excl. fees. Variable deal data starts Apr 1998 (zeros in the variable
   and lifetime series are placeholders), so 30-40 years isn't possible.
-- Variable types: rolling 2-yr variable (`IUMBV48`, margin over Bank Rate locked
-  24 months, then re-quoted; a proxy, as some older deals may be discounts off
-  SVR), lifetime tracker (`IUMBV24`, margin locked throughout) and SVR (`IUMTLMV`).
+- Variable types: rolling 2-yr tracker (`var2`: `IUMBV48` rate, margin over Bank
+  Rate locked 24 months, then re-quoted), rolling 2-yr discount (`disc2`: same
+  starting rate, but the gap to SVR is locked, so it follows `IUMTLMV`; collars
+  not modelled), lifetime tracker (`IUMBV24`, margin locked throughout) and SVR
+  (`IUMTLMV`). The BoE series doesn't split trackers from discounts, so the two
+  rolling types bracket it. Colours per strategy are in `HIST_COLOURS`.
 - Methods: continuous (every start month) or segments (block bootstrap, 2- or
   5-year pieces). Continuous windows overlap heavily, so few are independent.
   Segment payment rises are overstated because rates leap where pieces join.
@@ -192,6 +195,8 @@ Intended for Streamlit Community Cloud from this repo (`app.py`, branch
 settings.
 
 ## Changelog
+- **2026-11-15** — Variable or fixed test: rolling 2-year discount (follows the
+  SVR) alongside the tracker.
 - **2026-11-10** — Mortgage overpayments (monthly and lump sums) in Buy vs invest
   and the Mortgage tab detail view.
 - **2026-11-10** — Savings beyond the purchase invested on both paths; third

@@ -7,7 +7,9 @@ paired. No Streamlit imports.
 
 Strategies
   fix2  Rolling 2-yr fix: rate locked at the quoted fix, re-quoted every 24 months
-  var2  Rolling 2-yr variable: margin over Bank Rate locked for 24 months, re-quoted
+  var2  Rolling 2-yr tracker: margin over Bank Rate locked for 24 months, re-quoted
+  disc2 Rolling 2-yr discount: same starting rate as var2, but the gap to the lender's
+        SVR is locked for 24 months, so the rate follows the SVR, not Bank Rate
   life  Lifetime tracker: margin over Bank Rate locked for the whole period
   svr   Pays the lender's revert-to rate each month
 
@@ -26,8 +28,9 @@ import rates
 CODES = {"IUMBV34": "fix2", "IUMBV48": "var2", "IUMBV24": "life",
          "IUMTLMV": "svr", "IUMABEDR": "bank"}
 DEAL_MONTHS = 24
-VARIABLE_TYPES = ["var2", "life", "svr"]
-NAMES = {"fix2": "Rolling 2-yr fix", "var2": "Rolling 2-yr variable",
+VARIABLE_TYPES = ["var2", "disc2", "life", "svr"]
+NAMES = {"fix2": "Rolling 2-yr fix", "var2": "Rolling 2-yr tracker",
+         "disc2": "Rolling 2-yr discount",
          "life": "Lifetime tracker", "svr": "Standard variable rate"}
 
 
@@ -41,6 +44,7 @@ def prepare(raw: pd.DataFrame) -> pd.DataFrame:
     for product in ("var2", "life"):  # zeros in these series are placeholders
         df[product] = df[product].where(df[product] > 0)
     df["var2_margin"] = df["var2"] - df["bank"]
+    df["disc2_margin"] = df["var2"] - df["svr"]  # negative: a discount off the SVR
     # Margins are only read at the start of a deal; carry over the odd gap
     df["life_margin"] = (df["life"] - df["bank"]).ffill()
     return df.dropna(subset=["var2", "fix2", "svr", "bank"])
@@ -68,6 +72,7 @@ def rate_paths(d: pd.DataFrame, idx: np.ndarray) -> dict:
     return {
         "fix2": d["fix2"].values[start_idx],
         "var2": bank[idx] + d["var2_margin"].values[start_idx],
+        "disc2": d["svr"].values[idx] + d["disc2_margin"].values[start_idx],
         "life": bank[idx] + d["life_margin"].values[idx[:, 0]][:, None],
         "svr": d["svr"].values[idx],
     }

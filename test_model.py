@@ -228,6 +228,19 @@ def test_history_fix_locks_and_variable_follows_bank_rate():
     assert p["life"][0, 24] == pytest.approx(0.07)  # keeps its first margin
 
 
+def test_history_discount_follows_svr_not_bank_rate():
+    bank = [5.0] * 12 + [1.0] * 24       # Bank Rate cut by 4pp
+    svr = [7.0] * 12 + [6.0] * 24        # the lender only cuts its SVR by 1pp
+    d = _history(n=36, fix=5.0, var=6.0, bank=bank, svr=svr)
+    p = history.rate_paths(d, np.arange(36)[None, :])
+    assert p["disc2"][0, 0] == pytest.approx(p["var2"][0, 0])  # same starting rate
+    assert p["disc2"][0, 12] == pytest.approx(0.05)  # SVR - 1pp discount
+    assert p["var2"][0, 12] == pytest.approx(0.02)   # Bank Rate + 1pp margin
+    assert p["disc2"][0, 24] == pytest.approx(0.06)  # new deal: re-quoted at var2
+    r = history.run_test(d, 3)
+    assert (r["savings"]["disc2"] < r["savings"]["var2"]).all()
+
+
 def test_history_segments_stay_in_range():
     idx = history.segment_windows(100, 10, 24, 50)
     assert idx.shape == (50, 120) and idx.min() >= 0 and idx.max() < 100

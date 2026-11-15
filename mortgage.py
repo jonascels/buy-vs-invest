@@ -265,6 +265,12 @@ def cached_test(d: pd.DataFrame, years: int, method: str, block: int, loan: floa
     return history.run_test(d, years, method, block, 5_000, loan, term)
 
 
+# One colour per strategy, the same in every chart
+HIST_COLOURS = {"var2": SERIES_COLOURS[0], "life": SERIES_COLOURS[1],
+                "svr": SERIES_COLOURS[2], "fix2": SERIES_COLOURS[3],
+                "disc2": SERIES_COLOURS[4]}
+
+
 def variable_vs_fixed(price: float) -> None:
     st.caption(
         "Is a variable mortgage cheaper than a series of 2-year fixes? This replays real "
@@ -317,12 +323,12 @@ def variable_vs_fixed(price: float) -> None:
 
     st.subheader("Spread of savings")
     fig = go.Figure()
-    for i, key in enumerate(history.VARIABLE_TYPES):
+    for key in history.VARIABLE_TYPES:
         fig.add_trace(go.Box(x=result["savings"][key], name=history.NAMES[key],
-                             marker=dict(color=SERIES_COLOURS[i]), boxmean=True,
+                             marker=dict(color=HIST_COLOURS[key]), boxmean=True,
                              boxpoints=False, orientation="h"))
     fig.add_vline(x=0, line_color="#999999", line_dash="dot")
-    fig.update_layout(height=300, xaxis_title="Interest saved compared with fixes (£)",
+    fig.update_layout(height=360, xaxis_title="Interest saved compared with fixes (£)",
                       showlegend=False,
                       **BOX_LAYOUT)
     st.plotly_chart(fig, use_container_width=True)
@@ -332,10 +338,10 @@ def variable_vs_fixed(price: float) -> None:
     if kw[0] == "continuous":
         st.subheader("Does the start date matter?")
         fig = go.Figure()
-        for i, key in enumerate(history.VARIABLE_TYPES):
+        for key in history.VARIABLE_TYPES:
             fig.add_trace(go.Scatter(
                 x=result["starts"], y=result["savings"][key], name=history.NAMES[key],
-                mode="lines", line=dict(color=SERIES_COLOURS[i], width=2),
+                mode="lines", line=dict(color=HIST_COLOURS[key], width=2),
                 hovertemplate=f"{history.NAMES[key]}: £%{{y:,.0f}}<extra></extra>"))
         fig.add_hline(y=0, line_color="#999999", line_dash="dot")
         fig.update_layout(height=340, xaxis_title="Month the mortgage started",
@@ -343,29 +349,32 @@ def variable_vs_fixed(price: float) -> None:
         st.plotly_chart(fig, use_container_width=True)
 
     deals = history.single_deals(d)
-    st.subheader("What drove the difference on single 2-year deals?")
+    st.subheader("What drove the difference on single 2-year tracker deals?")
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Variable cheaper", f"{100 * (deals['gap'] > 0).mean():.0f}% of deals")
+    m1.metric("Tracker cheaper", f"{100 * (deals['gap'] > 0).mean():.0f}% of deals")
     m2.metric("Average rate advantage", f"{deals['gap'].mean():+.2f}pp",
-              help="Average rate on rolling 2-year fixes minus the variable deal.")
+              help="Average rate on rolling 2-year fixes minus the tracker deal.")
     m3.metric("Lower starting rate", f"{deals['premium'].mean():+.2f}pp",
-              help="How much lower the variable deal's rate was on day one.")
+              help="How much lower the tracker deal's rate was on day one.")
     m4.metric("Without falling rates", f"{deals['gap_no_drift'].mean():+.2f}pp",
               help="The advantage after removing Bank Rate's overall fall across the data. "
-                   f"Variable would win {100 * (deals['gap_no_drift'] > 0).mean():.0f}% of deals.")
+                   f"The tracker would win {100 * (deals['gap_no_drift'] > 0).mean():.0f}% of deals.")
 
     st.subheader("The rates behind this test")
     fig = go.Figure()
-    for key, colour, dash in (("fix2", SERIES_COLOURS[3], None), ("var2", SERIES_COLOURS[0], None),
-                              ("life", SERIES_COLOURS[1], None), ("svr", SERIES_COLOURS[2], None),
-                              ("bank", "#777777", "dot")):
-        name = history.NAMES.get(key, "Bank Rate")
+    labels = {"var2": "2-year variable deals", "bank": "Bank Rate"}
+    for key in ("fix2", "var2", "life", "svr", "bank"):
+        colour, dash = HIST_COLOURS.get(key, "#777777"), "dot" if key == "bank" else None
+        name = labels.get(key, history.NAMES.get(key))
         fig.add_trace(go.Scatter(
             x=d.index, y=d[key] * 100, name=name, mode="lines", connectgaps=False,
             line=dict(color=colour, width=2, dash=dash),
             hovertemplate=f"{name}: %{{y:.2f}}%<extra></extra>"))
     fig.update_layout(height=340, yaxis_title="Rate (%)", **CHART_LAYOUT)
     st.plotly_chart(fig, use_container_width=True)
+    st.caption("The tracker and the discount both start at the 2-year variable deal rate. "
+               "The tracker then moves with Bank Rate, the discount with the standard "
+               "variable rate. Where those two lines drift apart, so do the results.")
 
     st.subheader("All results")
     rows = [history.summary(cached_test(d, y, kw[0], kw[1], loan, term)).assign(Years=y)
@@ -387,9 +396,14 @@ def variable_vs_fixed(price: float) -> None:
             f"""
 - **Data:** Bank of England average quoted rates at 75% LTV, {span}. Variable deal data doesn't
   go back further, so a 30- or 40-year test isn't possible.
-- **Rolling 2-year variable:** the margin over Bank Rate is locked for 2 years, then re-quoted.
-  This is a stand-in: some older deals in this series may have been discounts off the lender's
-  standard rate rather than true trackers.
+- **Rolling 2-year tracker and discount:** both start each 2-year deal at the Bank of England's
+  average 2-year variable rate, then re-quote. The tracker's rate is Bank Rate plus a margin
+  locked for 2 years. The discount's rate is the lender's standard variable rate minus a gap
+  locked for 2 years, so it moves when the lender moves its standard rate, which hasn't always
+  followed Bank Rate (in 2009, Bank Rate fell to 0.5% while standard rates stayed near 4%).
+  The Bank's series doesn't say how many deals were trackers or discounts, so the truth for
+  any one borrower sits somewhere between the two. Collars (a floor on discount rates) aren't
+  modelled.
 - **Lifetime tracker:** the margin is locked for the whole period. Margins have varied a lot over
   time, so older start dates may reflect deals that aren't on offer today.
 - **Biggest 12-month rise:** the largest increase in the monthly payment compared with a year
